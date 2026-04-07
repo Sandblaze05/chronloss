@@ -2,9 +2,23 @@ import { createTile } from './Tile.js';
 import { generateHeightAt } from './Noise.js';
 
 export const CHUNK_SIZE = 16;
+export const CHUNK_HEIGHT = 64;
+
+export const BLOCK_IDS = {
+  AIR: 0,
+  STONE: 1,
+  DIRT: 2,
+  GRASS: 3,
+  SAND: 4,
+  WATER: 5,
+  SNOW: 6,
+  DESERT: 7,
+  FOREST: 8,
+};
 
 export const DEFAULT_WORLD_OPTIONS = {
   seed: 0,
+  chunkHeight: CHUNK_HEIGHT,
   scale: 40,
   octaves: 4,
   persistence: 0.5,
@@ -12,7 +26,35 @@ export const DEFAULT_WORLD_OPTIONS = {
   minHeight: 0,
   maxHeight: 20,
   blockHeight: 1, // dont change
+  caveScale: 24,
+  caveOctaves: 3,
+  cavePersistence: 0.5,
+  caveLacunarity: 2,
+  caveThreshold: 0.3,
 };
+
+export function chunkArrayLength(chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT) {
+  return chunkSize * chunkSize * chunkHeight;
+}
+
+export function voxelIndex(x, y, z, chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT) {
+  return x + (y * chunkSize) + (z * chunkSize * chunkHeight);
+}
+
+export function inChunkBounds(x, y, z, chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT) {
+  return x >= 0 && x < chunkSize && y >= 0 && y < chunkHeight && z >= 0 && z < chunkSize;
+}
+
+export function getVoxel(chunk, x, y, z) {
+  if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return BLOCK_IDS.AIR;
+  return chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)];
+}
+
+export function setVoxel(chunk, x, y, z, blockId) {
+  if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return false;
+  chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)] = blockId;
+  return true;
+}
 
 export function generateWorld(width, height, options = {}) {
   const opts = { ...DEFAULT_WORLD_OPTIONS, ...options };

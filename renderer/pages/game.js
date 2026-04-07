@@ -1,9 +1,35 @@
 import React, { useEffect, useRef } from 'react'
 import * as THREE from 'three'
-import { CHUNK_SIZE, chunkKey, DEFAULT_WORLD_OPTIONS } from '../lib/engine/World.js';
+import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, chunkArrayLength, chunkKey, DEFAULT_WORLD_OPTIONS, getVoxel, setVoxel, voxelIndex } from '../lib/engine/World.js';
 import { buildChunkMeshes, disposeChunkMeshes } from '../lib/engine/Renderer.js';
 import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from '../lib/engine/GridMath.js';
-import { generateHeightAt, generateBiomeAt, fbm2D } from '../lib/engine/Noise.js';
+import { fbm2D, fbm3D, generateBiomeAt } from '../lib/engine/Noise.js';
+
+const idToBlock = (id) => {
+  switch (id) {
+    case 0:
+      return 'AIR'
+    case 1:
+      return 'STONE'
+    case 2:
+      return 'DIRT'
+    case 3:
+      return 'GRASS'
+    case 4:
+      return 'SAND'
+    case 5:
+      return 'WATER'
+    case 6:
+      return 'SNOW'
+    case 7:
+      return 'DESERT'
+    case 8:
+      return 'FOREST'
+    default:
+      break;
+  }
+  return -1;
+}
 
 const GamePage = () => {
 
@@ -104,48 +130,68 @@ const GamePage = () => {
     let smoothedFps = 0;
     let lastDebugRefresh = 0;
 
-    function buildChunkFromHeights(cx, cy, chunkSize, heights, biomes) {
-      const tiles = new Map();
-      const startC = cx * chunkSize;
-      const startR = cy * chunkSize;
-      let i = 0;
-      for (let r = 0; r < chunkSize; r++) {
-        for (let c = 0; c < chunkSize; c++) {
-          const gc = startC + c;
-          const gr = startR + r;
-          tiles.set(`${gc},${gr}`, {
-            col: gc,
-            row: gr,
-            type: biomes ? biomes[i] : 'floor',
-            traversable: true,
-            height: heights[i++],
-          });
-        }
-      }
-      return { cx, cy, tiles };
+    function buildChunkFromBlocks(cx, cy, chunkSize, chunkHeight, blocks) {
+      return {
+        cx,
+        cy,
+        chunkSize,
+        chunkHeight,
+        blocks,
+      };
     }
 
-    function generateChunkDataSync(cx, cy, chunkSize, options) {
+    function generateChunkDataSync(cx, cy, chunkSize, chunkHeight, options) {
       const opts = { ...DEFAULT_WORLD_OPTIONS, ...(options || {}) };
-      const heights = new Float32Array(chunkSize * chunkSize);
-      const biomes = new Array(chunkSize * chunkSize);
+      const localChunkHeight = Number(chunkHeight || opts.chunkHeight) || CHUNK_HEIGHT;
+      const blocks = new Uint8Array(chunkArrayLength(chunkSize, localChunkHeight));
       const startC = cx * chunkSize;
       const startR = cy * chunkSize;
-      let i = 0;
-      for (let r = 0; r < chunkSize; r++) {
-        for (let c = 0; c < chunkSize; c++) {
-          const col = startC + c;
-          const row = startR + r;
-          // get normalized noise first
+      for (let z = 0; z < chunkSize; z++) {
+        for (let x = 0; x < chunkSize; x++) {
+          const col = startC + x;
+          const row = startR + z;
           let n = fbm2D(col, row, opts);
           n = Math.pow(n, opts.exponent || 1.0);
-          const h = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0))) * (opts.blockHeight || 1);
-          heights[i] = h;
-          biomes[i] = generateBiomeAt(col, row, n, opts);
-          i++;
+          const surfaceY = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0)));
+
+          const biomeStr = generateBiomeAt(col, row, n, opts);
+          let surfaceBlockId = BLOCK_IDS.GRASS;
+          if (biomeStr === 'water') surfaceBlockId = BLOCK_IDS.WATER;
+          if (biomeStr === 'sand') surfaceBlockId = BLOCK_IDS.SAND;
+          if (biomeStr === 'snow') surfaceBlockId = BLOCK_IDS.SNOW;
+          if (biomeStr === 'desert') surfaceBlockId = BLOCK_IDS.DESERT;
+          if (biomeStr === 'forest') surfaceBlockId = BLOCK_IDS.FOREST;
+
+          const caveSeed = typeof opts.seed === 'number' ? opts.seed + 999 : `${opts.seed}_999`;
+          for (let y = 0; y < localChunkHeight; y++) {
+            const index = voxelIndex(x, y, z, chunkSize, localChunkHeight);
+
+            if (y > surfaceY) {
+              blocks[index] = BLOCK_IDS.AIR;
+            } else if (y === surfaceY) {
+              blocks[index] = surfaceBlockId;
+            } else if (y >= surfaceY - 3) {
+              if (surfaceBlockId === BLOCK_IDS.SAND || surfaceBlockId === BLOCK_IDS.DESERT) {
+                blocks[index] = BLOCK_IDS.SAND;
+              } else {
+                blocks[index] = BLOCK_IDS.DIRT;
+              }
+            } else {
+              const caveDensity = fbm3D(col, y, row, {
+                seed: caveSeed,
+                scale: opts.caveScale,
+                octaves: opts.caveOctaves,
+              });
+              if (caveDensity < (opts.caveThreshold || 0.3)) {
+                blocks[index] = BLOCK_IDS.AIR;
+              } else {
+                blocks[index] = BLOCK_IDS.STONE;
+              }
+            }
+          }
         }
       }
-      return { heights, biomes };
+      return { chunkHeight: localChunkHeight, blocks };
     }
 
     function requestIpcChunkBatch(batch) {
@@ -169,8 +215,8 @@ const GamePage = () => {
               cx: item.cx,
               cy: item.cy,
               chunkSize: item.chunkSize || CHUNK_SIZE,
-                heights: new Float32Array(item.heights),
-                biomes: item.biomes || null,
+              chunkHeight: item.chunkHeight || CHUNK_HEIGHT,
+              blocks: new Uint8Array(item.blocks),
             });
           }
         })
@@ -180,13 +226,13 @@ const GamePage = () => {
             const key = chunkKey(item.cx, item.cy);
             pendingChunkKeys.delete(key);
             if (!loadQueueSet.has(key) && !activeChunks.has(key)) continue;
-            const data = generateChunkDataSync(item.cx, item.cy, CHUNK_SIZE, DEFAULT_WORLD_OPTIONS);
+            const data = generateChunkDataSync(item.cx, item.cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
             generatedChunkQueue.push({
               cx: item.cx,
               cy: item.cy,
               chunkSize: CHUNK_SIZE,
-              heights: data.heights,
-              biomes: data.biomes,
+              chunkHeight: data.chunkHeight,
+              blocks: data.blocks,
             });
           }
         })
@@ -225,7 +271,7 @@ const GamePage = () => {
           }
 
           pendingChunkKeys.add(key);
-          const data = generateChunkDataSync(cx, cy, CHUNK_SIZE, DEFAULT_WORLD_OPTIONS);
+          const data = generateChunkDataSync(cx, cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
           pendingChunkKeys.delete(key);
 
           if (!loadQueueSet.has(key) && !activeChunks.has(key)) {
@@ -236,8 +282,8 @@ const GamePage = () => {
             cx,
             cy,
             chunkSize: CHUNK_SIZE,
-            heights: data.heights,
-            biomes: data.biomes,
+            chunkHeight: data.chunkHeight,
+            blocks: data.blocks,
           });
           generatedNow += 1;
         }
@@ -265,7 +311,7 @@ const GamePage = () => {
       const key = chunkKey(generated.cx, generated.cy);
       if (chunks.has(key)) return;
 
-      const chunk = buildChunkFromHeights(generated.cx, generated.cy, generated.chunkSize, generated.heights, generated.biomes);
+      const chunk = buildChunkFromBlocks(generated.cx, generated.cy, generated.chunkSize, generated.chunkHeight, generated.blocks);
       chunks.set(key, chunk);
       buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
 
@@ -378,54 +424,95 @@ const GamePage = () => {
       new THREE.BoxGeometry(1, 2, 1),
       new THREE.MeshStandardMaterial({ color: 0x00ffcc })
     );
-    cube.position.y = 1;
+    const PLAYER_HALF_WIDTH = 0.42;
+    const PLAYER_HALF_HEIGHT = 1;
+    const FOOT_CLEARANCE = 0.04;
+    cube.position.y = PLAYER_HALF_HEIGHT + FOOT_CLEARANCE;
     scene.add(cube);
 
     // raycaster for hover / selection
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
 
-    const onPointerMove = (event) => {
+    function rebuildChunkMesh(chunk) {
+      if (!chunk) return;
+      if (chunk.instancedMeshes) {
+        for (const m of chunk.instancedMeshes) {
+          const idx = chunkMeshes.indexOf(m);
+          if (idx !== -1) chunkMeshes.splice(idx, 1);
+        }
+      }
+      disposeChunkMeshes(scene, chunk);
+      buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
+      if (chunk.instancedMeshes) {
+        for (const m of chunk.instancedMeshes) {
+          if (!m) continue;
+          chunkMeshes.push(m);
+        }
+      }
+    }
+
+    function getRaycastHit(event) {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
       raycaster.setFromCamera(pointer, camera);
       const intersects = raycaster.intersectObjects(chunkMeshes);
+      if (!intersects.length) return null;
 
-      if (intersects.length) {
-        const p = intersects[0].point;
-        const local = worldToGrid({ x: p.x, z: p.z });
-        const tc = Math.round(local.c);
-        const tr = Math.round(local.r);
+      const hit = intersects[0];
+      const mesh = hit.object;
+      const instanceId = hit.instanceId;
+      const blockPositions = mesh?.userData?.blockPositions;
+      const chunk = mesh?.userData?.chunk;
+      if (!chunk || typeof instanceId !== 'number' || !blockPositions || !blockPositions[instanceId]) return null;
 
-        const pcx = Math.floor(tc / CHUNK_SIZE);
-        const pcy = Math.floor(tr / CHUNK_SIZE);
-        const chunkData = chunks.get(chunkKey(pcx, pcy));
-        if (chunkData) {
-          const tile = chunkData.tiles.get(`${tc},${tr}`);
-          if (tile) {
-            const pos = gridToWorld(tile.col - xOffset, tile.row - yOffset);
-            highlightMesh.position.x = pos.x;
-            highlightMesh.position.z = pos.z;
-            const heightScale = Math.max(0.1, tile.height);
-            highlightMesh.position.y = heightScale + 0.05;
-            highlightMesh.visible = true;
-            hoveredInfo = { c: tc, r: tr, biome: tile.type, world: pos };
-          } else {
-            highlightMesh.visible = false;
-            hoveredInfo = null;
-          }
-        } else {
-          highlightMesh.visible = false;
-          hoveredInfo = null;
-        }
+      const block = blockPositions[instanceId];
+      const normal = hit.face?.normal ? hit.face.normal.clone().round() : new THREE.Vector3(0, 1, 0);
+      return { chunk, block, normal };
+    }
+
+    const onPointerMove = (event) => {
+      const hit = getRaycastHit(event);
+      if (hit) {
+        const wx = hit.block.wx;
+        const wz = hit.block.wz;
+        highlightMesh.position.x = wx;
+        highlightMesh.position.z = wz;
+        highlightMesh.position.y = hit.block.y + 1.02;
+        highlightMesh.visible = true;
+        hoveredInfo = { x: wx, y: hit.block.y, z: wz, id: getVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z) };
       } else {
         highlightMesh.visible = false;
+        hoveredInfo = null;
       }
     };
 
+    const onPointerDown = (event) => {
+      const hit = getRaycastHit(event);
+      if (!hit) return;
+
+      if (event.button === 0) {
+        setVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z, BLOCK_IDS.AIR);
+        rebuildChunksNearWorldVoxel(hit.block.wx, hit.block.wz);
+      } else if (event.button === 2) {
+        const pwx = hit.block.wx + hit.normal.x;
+        const py = hit.block.y + hit.normal.y;
+        const pwz = hit.block.wz + hit.normal.z;
+        const targetChunk = getChunkByWorldVoxel(pwx, pwz);
+        if (!targetChunk) return;
+        const local = worldToLocalVoxel(pwx, pwz);
+        if (setVoxel(targetChunk, local.lx, py, local.lz, BLOCK_IDS.STONE)) {
+          rebuildChunksNearWorldVoxel(pwx, pwz);
+        }
+      }
+    };
+
+    const onContextMenu = (event) => event.preventDefault();
+
     renderer.domElement.addEventListener('pointermove', onPointerMove);
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     // keyboard handlers for WASD movement
     const onKeyDown = (e) => {
@@ -454,6 +541,7 @@ const GamePage = () => {
     let useIpcEcs = !!(ipc && typeof ipc.invoke === 'function' && typeof ipc.send === 'function');
     const ecsState = { x: playerWorld.x, y: 1, z: playerWorld.z };
     const localVelocity = { x: 0, y: 0, z: 0 };
+    let localVerticalVelocity = 0;
     let unsubscribeEcs = null;
     let lastSentVelocity = { x: 0, y: 0, z: 0 };
     let lastVelocitySendTime = 0;
@@ -500,6 +588,117 @@ const GamePage = () => {
       return { cx: Math.floor(c / CHUNK_SIZE), cy: Math.floor(r / CHUNK_SIZE) };
     }
 
+    function getVoxelAtWorld(wx, wy, wz) {
+      if (wy < 0) return BLOCK_IDS.STONE;
+      const cx = Math.floor(wx / CHUNK_SIZE);
+      const cy = Math.floor(wz / CHUNK_SIZE);
+      const chunkData = chunks.get(chunkKey(cx, cy));
+      if (!chunkData) return BLOCK_IDS.AIR;
+      if (wy >= chunkData.chunkHeight) return BLOCK_IDS.AIR;
+
+      const lx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      const lz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      return getVoxel(chunkData, lx, wy, lz);
+    }
+
+    function getSurfaceCenterYAtWorld(x, z) {
+      const vx = Math.floor(x);
+      const vz = Math.floor(z);
+      const cx = Math.floor(vx / CHUNK_SIZE);
+      const cy = Math.floor(vz / CHUNK_SIZE);
+      const chunkData = chunks.get(chunkKey(cx, cy));
+      if (!chunkData) return null;
+
+      const lx = ((vx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      const lz = ((vz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      for (let y = chunkData.chunkHeight - 1; y >= 0; y--) {
+        if (getVoxel(chunkData, lx, y, lz) > BLOCK_IDS.AIR) {
+          return (y + 1) + PLAYER_HALF_HEIGHT + FOOT_CLEARANCE;
+        }
+      }
+      return PLAYER_HALF_HEIGHT + FOOT_CLEARANCE;
+    }
+
+    function collidesAabb(centerX, centerY, centerZ) {
+      const epsilon = 1e-4;
+      const minX = Math.floor((centerX - PLAYER_HALF_WIDTH) + epsilon);
+      const maxX = Math.floor((centerX + PLAYER_HALF_WIDTH) - epsilon);
+      const minY = Math.floor((centerY - PLAYER_HALF_HEIGHT) + epsilon);
+      const maxY = Math.floor((centerY + PLAYER_HALF_HEIGHT) - epsilon);
+      const minZ = Math.floor((centerZ - PLAYER_HALF_WIDTH) + epsilon);
+      const maxZ = Math.floor((centerZ + PLAYER_HALF_WIDTH) - epsilon);
+
+      for (let y = minY; y <= maxY; y++) {
+        for (let z = minZ; z <= maxZ; z++) {
+          for (let x = minX; x <= maxX; x++) {
+            if (getVoxelAtWorld(x, y, z) > BLOCK_IDS.AIR) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    function moveAlongAxis(position, axis, delta) {
+      if (Math.abs(delta) < 1e-7) return false;
+
+      const maxStep = 0.2;
+      const steps = Math.max(1, Math.ceil(Math.abs(delta) / maxStep));
+      const stepDelta = delta / steps;
+
+      for (let i = 0; i < steps; i++) {
+        const nextX = axis === 'x' ? position.x + stepDelta : position.x;
+        const nextY = axis === 'y' ? position.y + stepDelta : position.y;
+        const nextZ = axis === 'z' ? position.z + stepDelta : position.z;
+        if (collidesAabb(nextX, nextY, nextZ)) return true;
+        position.x = nextX;
+        position.y = nextY;
+        position.z = nextZ;
+      }
+
+      return false;
+    }
+
+    function resolvePenetrationUp(position, maxLift = CHUNK_HEIGHT + 2) {
+      if (!collidesAabb(position.x, position.y, position.z)) return true;
+      for (let i = 0; i < maxLift; i++) {
+        position.y += 1;
+        if (!collidesAabb(position.x, position.y, position.z)) return true;
+      }
+      return false;
+    }
+
+    function getChunkByWorldVoxel(wx, wz) {
+      const cx = Math.floor(wx / CHUNK_SIZE);
+      const cy = Math.floor(wz / CHUNK_SIZE);
+      return chunks.get(chunkKey(cx, cy)) || null;
+    }
+
+    function worldToLocalVoxel(wx, wz) {
+      const lx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      const lz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+      return { lx, lz };
+    }
+
+    function rebuildChunksNearWorldVoxel(wx, wz) {
+      const candidates = [
+        [wx, wz],
+        [wx + 1, wz],
+        [wx - 1, wz],
+        [wx, wz + 1],
+        [wx, wz - 1],
+      ];
+      const touched = new Set();
+      for (const [cxw, czw] of candidates) {
+        const ccx = Math.floor(cxw / CHUNK_SIZE);
+        const ccy = Math.floor(czw / CHUNK_SIZE);
+        const key = chunkKey(ccx, ccy);
+        if (touched.has(key)) continue;
+        touched.add(key);
+        const chunk = chunks.get(key);
+        if (chunk) rebuildChunkMesh(chunk);
+      }
+    }
+
     // load initial chunks around player
     const startChunk = gridToChunk(playerGrid.c, playerGrid.r);
     ensureChunksAround(startChunk.cx, startChunk.cy);
@@ -510,6 +709,9 @@ const GamePage = () => {
     let prevChunk = null;
     const PHYSICS_HZ = 60;
     const PHYSICS_DT = 1 / PHYSICS_HZ;
+    const GRAVITY = 28;
+    const TERMINAL_FALL_SPEED = 40;
+    let spawnHeightInitialized = false;
     let previousTime = performance.now() / 1000;
     let accumulator = 0;
 
@@ -531,8 +733,17 @@ const GamePage = () => {
 
       if (useIpcEcs) {
         playerWorld.x = THREE.MathUtils.lerp(playerWorld.x, ecsState.x, ECS_POSITION_SMOOTHING);
-        playerWorld.y = THREE.MathUtils.lerp(playerWorld.y, ecsState.y, ECS_POSITION_SMOOTHING);
         playerWorld.z = THREE.MathUtils.lerp(playerWorld.z, ecsState.z, ECS_POSITION_SMOOTHING);
+      }
+
+      if (!spawnHeightInitialized) {
+        const spawnY = getSurfaceCenterYAtWorld(playerWorld.x, playerWorld.z);
+        if (spawnY !== null) {
+          playerWorld.y = spawnY;
+          playerPrevWorld.y = spawnY;
+          localVerticalVelocity = 0;
+          spawnHeightInitialized = true;
+        }
       }
 
       // Compute desired velocity from input and write into shared buffer
@@ -551,38 +762,19 @@ const GamePage = () => {
 
       const vWorld = gridToWorld(vTilesC, vTilesR);
 
-      // climb check using projected candidate position
-      const cand = {
-        x: playerWorld.x + vWorld.x * dt,
-        z: playerWorld.z + vWorld.z * dt,
-      };
-      const derived = worldToGrid(cand);
-      const tc = Math.round(derived.c);
-      const tr = Math.round(derived.r);
-      const currentGrid = worldToGrid(playerWorld);
-      const currentC = Math.round(currentGrid.c);
-      const currentR = Math.round(currentGrid.r);
+      const moveDt = Math.max(dt, 1e-5);
+      const desiredDx = vWorld.x * dt;
+      const desiredDz = vWorld.z * dt;
 
-      function getTileHeight(c, r) {
-        const pcx = Math.floor(c / CHUNK_SIZE);
-        const pcy = Math.floor(r / CHUNK_SIZE);
-        const chunkData = chunks.get(chunkKey(pcx, pcy));
-        if (!chunkData) return 0;
-        const tile = chunkData.tiles.get(`${c},${r}`);
-        return tile ? tile.height : 0;
-      }
-
-      const candidateHeight = getTileHeight(tc, tr);
-      const currentHeight = getTileHeight(currentC, currentR);
-      const maxClimb = DEFAULT_WORLD_OPTIONS.blockHeight || 1;
+      const testPos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
+      moveAlongAxis(testPos, 'x', desiredDx);
+      moveAlongAxis(testPos, 'z', desiredDz);
+      const resolvedVx = (testPos.x - playerWorld.x) / moveDt;
+      const resolvedVz = (testPos.z - playerWorld.z) / moveDt;
 
       if (useIpcEcs) {
-        let vx = 0;
-        let vz = 0;
-        if (candidateHeight - currentHeight <= maxClimb) {
-          vx = vWorld.x;
-          vz = vWorld.z;
-        }
+        const vx = resolvedVx;
+        const vz = resolvedVz;
 
         const now = performance.now();
         const changed =
@@ -593,39 +785,43 @@ const GamePage = () => {
           lastSentVelocity = { x: vx, y: 0, z: vz };
           lastVelocitySendTime = now;
         }
-      } else if (candidateHeight - currentHeight <= maxClimb) {
-        localVelocity.x = vWorld.x;
-        localVelocity.y = 0;
-        localVelocity.z = vWorld.z;
       } else {
-        localVelocity.x = 0;
-        localVelocity.y = 0;
-        localVelocity.z = 0;
+        localVelocity.x = resolvedVx;
+        localVelocity.z = resolvedVz;
       }
 
       if (!useIpcEcs) {
-        playerWorld.x += localVelocity.x * dt;
-        playerWorld.y += localVelocity.y * dt;
-        playerWorld.z += localVelocity.z * dt;
+        const movePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
+        moveAlongAxis(movePos, 'x', localVelocity.x * dt);
+        moveAlongAxis(movePos, 'z', localVelocity.z * dt);
+
+        playerWorld.x = movePos.x;
+        playerWorld.z = movePos.z;
       }
+
+      const verticalPos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
+      if (resolvePenetrationUp(verticalPos)) {
+        playerWorld.y = verticalPos.y;
+      }
+
+      const grounded = collidesAabb(playerWorld.x, playerWorld.y - 0.06, playerWorld.z);
+      if (!grounded) {
+        localVerticalVelocity = Math.max(localVerticalVelocity - GRAVITY * dt, -TERMINAL_FALL_SPEED);
+      } else if (localVerticalVelocity < 0) {
+        localVerticalVelocity = 0;
+      }
+
+      localVelocity.y = localVerticalVelocity;
+      const yMovePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
+      const blockedY = moveAlongAxis(yMovePos, 'y', localVelocity.y * dt);
+      if (blockedY && localVelocity.y < 0) {
+        localVerticalVelocity = 0;
+      }
+      playerWorld.y = yMovePos.y;
 
       const derivedGrid = worldToGrid(playerWorld);
       playerGrid.c = derivedGrid.c;
       playerGrid.r = derivedGrid.r;
-      
-
-      // Update player vertical position to tile top
-      const pc = Math.round(playerGrid.c);
-      const pr = Math.round(playerGrid.r);
-      const pcx = Math.floor(pc / CHUNK_SIZE);
-      const pcy = Math.floor(pr / CHUNK_SIZE);
-      const chunkData = chunks.get(chunkKey(pcx, pcy));
-      let targetY = 1;
-      if (chunkData) {
-        const tile = chunkData.tiles.get(`${pc},${pr}`);
-        if (tile) targetY = tile.height + 1;
-      }
-      playerWorld.y = targetY;
 
       // check chunk transitions and stream chunks when player moves between chunks
       const currentChunk = gridToChunk(playerGrid.c, playerGrid.r);
@@ -690,7 +886,7 @@ const GamePage = () => {
           // show player world-space and grid coordinates for debugging
           `player world: ${playerWorld.x.toFixed(2)},${playerWorld.y.toFixed(2)},${playerWorld.z.toFixed(2)}`,
           `player grid: ${playerGrid.c.toFixed(2)},${playerGrid.r.toFixed(2)}`,
-          hoveredInfo ? `hover: grid ${hoveredInfo.c},${hoveredInfo.r}  biome: ${hoveredInfo.biome}` : `hover: -`,
+          hoveredInfo ? `hover: ${hoveredInfo.x},${hoveredInfo.y},${hoveredInfo.z}  id: ${idToBlock(hoveredInfo.id)}` : `hover: -`,
           `chunks in range: ${activeChunks.size}/${expectedInRange}`,
           `chunk radius: ${chunkRadius}`,
           `queued: ${loadQueue.length}  pending: ${pendingChunkKeys.size}  generated: ${generatedChunkQueue.length}`,
@@ -726,6 +922,8 @@ const GamePage = () => {
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', onResize);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       renderer.dispose();
       container.removeChild(renderer.domElement);
       container.removeChild(debugPanel);

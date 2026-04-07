@@ -121,3 +121,67 @@ export function generateBiomeAt(col, row, normalizedHeight, options = {}) {
   if (moisture < 0.6) return 'grass';
   return 'forest';
 }
+
+function hash3D(x, y, z, seed) {
+  const s = seedToNumber(seed);
+  let n = (x * 374761393 + y * 668265263 + z * 2147483647) >>> 0;
+  n = (n ^ s) >>> 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177) >>> 0;
+  return (n >>> 0) / 4294967295;
+}
+
+export function valueNoise3D(x, y, z, seed) {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const z0 = Math.floor(z);
+  const x1 = x0 + 1;
+  const y1 = y0 + 1;
+  const z1 = z0 + 1;
+
+  const sx = fade(x - x0);
+  const sy = fade(y - y0);
+  const sz = fade(z - z0);
+
+  const n000 = hash3D(x0, y0, z0, seed);
+  const n100 = hash3D(x1, y0, z0, seed);
+  const n010 = hash3D(x0, y1, z0, seed);
+  const n110 = hash3D(x1, y1, z0, seed);
+  const n001 = hash3D(x0, y0, z1, seed);
+  const n101 = hash3D(x1, y0, z1, seed);
+  const n011 = hash3D(x0, y1, z1, seed);
+  const n111 = hash3D(x1, y1, z1, seed);
+
+  const nx00 = lerp(n000, n100, sx);
+  const nx10 = lerp(n010, n110, sx);
+  const nx01 = lerp(n001, n101, sx);
+  const nx11 = lerp(n011, n111, sx);
+
+  const nxy0 = lerp(nx00, nx10, sy);
+  const nxy1 = lerp(nx01, nx11, sy);
+
+  return lerp(nxy0, nxy1, sz);
+}
+
+export function fbm3D(x, y, z, options = {}) {
+  const {
+    seed = 0,
+    octaves = 4,
+    persistence = 0.5,
+    lacunarity = 2.0,
+    scale = 8.0,
+  } = options;
+
+  let amplitude = 1;
+  let frequency = 1;
+  let value = 0;
+  let max = 0;
+  const base = seedToNumber(seed);
+  for (let i = 0; i < octaves; i++) {
+    const octaveSeed = (base + i * 1000) >>> 0;
+    value += valueNoise3D((x * frequency) / scale, (y * frequency) / scale, (z * frequency) / scale, octaveSeed) * amplitude;
+    max += amplitude;
+    amplitude *= persistence;
+    frequency *= lacunarity;
+  }
+  return value / max;
+}

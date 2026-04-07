@@ -10,32 +10,65 @@ app.commandLine.appendSwitch('enable-native-gpu-memory-buffers')
 app.commandLine.appendSwitch('enable-unsafe-webgpu')
 import serve from 'electron-serve'
 import { createWindow } from './helpers/create-window.js'
-import { CHUNK_SIZE, DEFAULT_WORLD_OPTIONS } from '../renderer/lib/engine/World.js'
-import { generateHeightAt, generateBiomeAt, fbm2D } from '../renderer/lib/engine/Noise.js'
+import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, DEFAULT_WORLD_OPTIONS, chunkArrayLength, voxelIndex } from '../renderer/lib/engine/World.js'
+import { fbm2D, fbm3D, generateBiomeAt } from '../renderer/lib/engine/Noise.js'
 
 const isProd = process.env.NODE_ENV === 'production'
 const ecsSessions = new Map()
 
-function chunkDataForIpc(cx, cy, chunkSize, options = {}) {
+function chunkDataForIpc(cx, cy, chunkSize, chunkHeight, options = {}) {
   const opts = { ...DEFAULT_WORLD_OPTIONS, ...options }
-  const heights = new Float32Array(chunkSize * chunkSize)
-  const biomes = new Array(chunkSize * chunkSize)
+  const localChunkHeight = Number(chunkHeight || opts.chunkHeight) || CHUNK_HEIGHT
+  const blocks = new Uint8Array(chunkArrayLength(chunkSize, localChunkHeight))
   const startC = cx * chunkSize
   const startR = cy * chunkSize
-  let i = 0
-  for (let r = 0; r < chunkSize; r++) {
-    for (let c = 0; c < chunkSize; c++) {
-      const col = startC + c
-      const row = startR + r
+  for (let z = 0; z < chunkSize; z++) {
+    for (let x = 0; x < chunkSize; x++) {
+      const col = startC + x
+      const row = startR + z
       let n = fbm2D(col, row, opts)
       n = Math.pow(n, opts.exponent || 1.0)
-      const h = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0))) * (opts.blockHeight || 1)
-      heights[i] = h
-      biomes[i] = generateBiomeAt(col, row, n, opts)
-      i++
+      const surfaceY = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0)))
+
+      const biomeStr = generateBiomeAt(col, row, n, opts)
+      let surfaceBlockId = BLOCK_IDS.GRASS
+      if (biomeStr === 'water') surfaceBlockId = BLOCK_IDS.WATER
+      if (biomeStr === 'sand') surfaceBlockId = BLOCK_IDS.SAND
+      if (biomeStr === 'snow') surfaceBlockId = BLOCK_IDS.SNOW
+      if (biomeStr === 'desert') surfaceBlockId = BLOCK_IDS.DESERT
+      if (biomeStr === 'forest') surfaceBlockId = BLOCK_IDS.FOREST
+
+      const caveSeed = typeof opts.seed === 'number' ? opts.seed + 999 : `${opts.seed}_999`
+
+      for (let y = 0; y < localChunkHeight; y++) {
+        const index = voxelIndex(x, y, z, chunkSize, localChunkHeight)
+
+        if (y > surfaceY) {
+          blocks[index] = BLOCK_IDS.AIR
+        } else if (y === surfaceY) {
+          blocks[index] = surfaceBlockId
+        } else if (y >= surfaceY - 3) {
+          if (surfaceBlockId === BLOCK_IDS.SAND || surfaceBlockId === BLOCK_IDS.DESERT) {
+            blocks[index] = BLOCK_IDS.SAND
+          } else {
+            blocks[index] = BLOCK_IDS.DIRT
+          }
+        } else {
+          const caveDensity = fbm3D(col, y, row, {
+            seed: caveSeed,
+            scale: opts.caveScale,
+            octaves: opts.caveOctaves,
+          })
+          if (caveDensity < (opts.caveThreshold || 0.3)) {
+            blocks[index] = BLOCK_IDS.AIR
+          } else {
+            blocks[index] = BLOCK_IDS.STONE
+          }
+        }
+      }
     }
   }
-  return { heights: heights.buffer, biomes }
+  return { blocks: blocks.buffer, chunkHeight: localChunkHeight }
 }
 
 function stopEcsSession(webContentsId) {
@@ -148,13 +181,13 @@ ipcMain.handle('world:generateChunks', async (_event, payload = {}) => {
   return cappedJobs.map((job) => {
     const cx = Number(job?.cx) || 0
     const cy = Number(job?.cy) || 0
-    const data = chunkDataForIpc(cx, cy, chunkSize, options)
+    const data = chunkDataForIpc(cx, cy, chunkSize, CHUNK_HEIGHT, options)
     return {
       cx,
       cy,
       chunkSize,
-      heights: data.heights,
-      biomes: data.biomes,
+      chunkHeight: data.chunkHeight,
+      blocks: data.blocks,
     }
   })
 })

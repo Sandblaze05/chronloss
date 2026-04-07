@@ -1,91 +1,135 @@
 import * as THREE from 'three';
-import { gridToWorld } from './GridMath.js';
+import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, inChunkBounds, voxelIndex } from './World.js';
 
-// Base materials (tintable)
-// floorMat.vertexColors = true;
-const floorMat = new THREE.MeshStandardMaterial({ color: 0xffffff, side: THREE.DoubleSide, flatShading: true });
-const wallMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, side: THREE.DoubleSide, flatShading: true });
-const lineMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+const voxelMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  flatShading: true,
+//   vertexColors: true,
+});
+const COLOR_STONE = new THREE.Color(0x808792);
+const COLOR_DIRT = new THREE.Color(0x7f5c3b);
+const COLOR_GRASS = new THREE.Color(0x4f8f3a);
+const COLOR_SAND = new THREE.Color(0xd9c27a);
+const COLOR_WATER = new THREE.Color(0x2f6fb3);
+const COLOR_SNOW = new THREE.Color(0xf2f6ff);
+const COLOR_DESERT = new THREE.Color(0xcfa86a);
+const COLOR_FOREST = new THREE.Color(0x2f6a34);
 
-// Biome palette (THREE.Color instances)
-const BIOME_COLORS = {
-    water: new THREE.Color(0x1a75ff),
-    sand: new THREE.Color(0xe6d690),
-    grass: new THREE.Color(0x5ca832),
-    forest: new THREE.Color(0x2d6614),
-    desert: new THREE.Color(0xd2b48c),
-    stone: new THREE.Color(0x737373),
-    snow: new THREE.Color(0xffffff),
-};
-const FALLBACK_COLOR = new THREE.Color(0xff00ff);
+function isSolid(blockId) {
+  return blockId > BLOCK_IDS.AIR;
+}
 
-export function buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset) {
-    // Count terrain vs walls
-    let terrainCount = 0;
-    let wallCount = 0;
-    for (const tile of chunk.tiles.values()) {
-        if (tile.type === 'wall') wallCount++;
-        else terrainCount++;
+function hasExposedFace(chunk, x, y, z) {
+  const dirs = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+  ];
+
+  for (const [dx, dy, dz] of dirs) {
+    const nx = x + dx;
+    const ny = y + dy;
+    const nz = z + dz;
+    if (!inChunkBounds(nx, ny, nz, chunk.chunkSize, chunk.chunkHeight)) return true;
+    const neighbor = chunk.blocks[voxelIndex(nx, ny, nz, chunk.chunkSize, chunk.chunkHeight)];
+    if (!isSolid(neighbor)) return true;
+  }
+
+  return false;
+}
+
+function colorForBlock(chunk, x, y, z, blockId) {
+  if (blockId === BLOCK_IDS.GRASS) return COLOR_GRASS;
+  if (blockId === BLOCK_IDS.SAND) return COLOR_SAND;
+  if (blockId === BLOCK_IDS.WATER) return COLOR_WATER;
+  if (blockId === BLOCK_IDS.SNOW) return COLOR_SNOW;
+  if (blockId === BLOCK_IDS.DESERT) return COLOR_DESERT;
+  if (blockId === BLOCK_IDS.FOREST) return COLOR_FOREST;
+  if (blockId === BLOCK_IDS.DIRT) {
+    const aboveSolid = inChunkBounds(x, y + 1, z, chunk.chunkSize, chunk.chunkHeight)
+      ? isSolid(chunk.blocks[voxelIndex(x, y + 1, z, chunk.chunkSize, chunk.chunkHeight)])
+      : false;
+    return aboveSolid ? COLOR_DIRT : COLOR_GRASS;
+  }
+  if (blockId === BLOCK_IDS.STONE) {
+    return COLOR_STONE;
+  }
+  return COLOR_STONE;
+}
+
+export function buildChunkMeshes(scene, chunk, tileGeom, _xOffset, _yOffset) {
+  const chunkSize = chunk.chunkSize || CHUNK_SIZE;
+  const chunkHeight = chunk.chunkHeight || CHUNK_HEIGHT;
+
+  let visibleCount = 0;
+  for (let z = 0; z < chunkSize; z++) {
+    for (let y = 0; y < chunkHeight; y++) {
+      for (let x = 0; x < chunkSize; x++) {
+        const index = voxelIndex(x, y, z, chunkSize, chunkHeight);
+        const blockId = chunk.blocks[index];
+        if (!isSolid(blockId)) continue;
+        if (hasExposedFace(chunk, x, y, z)) visibleCount++;
+      }
     }
+  }
 
-    const instancedMeshes = [];
-    const matrix = new THREE.Matrix4();
-
-    // Terrain instanced mesh (single draw call, per-instance colors)
-    if (terrainCount > 0) {
-        const terrainInst = new THREE.InstancedMesh(tileGeom, floorMat, terrainCount);
-        terrainInst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-        let i = 0;
-        for (const tile of chunk.tiles.values()) {
-            if (tile.type === 'wall') continue;
-            const pos = gridToWorld(tile.col - xOffset, tile.row - yOffset);
-            const heightScale = Math.max(0.1, tile.height);
-            matrix.identity();
-            matrix.makeTranslation(pos.x, 0, pos.z);
-            matrix.scale(new THREE.Vector3(1, heightScale, 1));
-            terrainInst.setMatrixAt(i, matrix);
-
-            // Set color by biome
-            const color = BIOME_COLORS[tile.type] || FALLBACK_COLOR;
-            terrainInst.setColorAt(i, color);
-            i++;
-        }
-        terrainInst.instanceMatrix.needsUpdate = true;
-        if (terrainInst.instanceColor) terrainInst.instanceColor.needsUpdate = true;
-        scene.add(terrainInst);
-        instancedMeshes.push(terrainInst);
-    }
-
-    // Walls (kept separate for now)
-    if (wallCount > 0) {
-        const wallInst = new THREE.InstancedMesh(tileGeom, wallMat, wallCount);
-        wallInst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-        let wi = 0;
-        for (const tile of chunk.tiles.values()) {
-            if (tile.type !== 'wall') continue;
-            const pos = gridToWorld(tile.col - xOffset, tile.row - yOffset);
-            const heightScale = Math.max(0.1, tile.height);
-            matrix.identity();
-            matrix.makeTranslation(pos.x, 0, pos.z);
-            matrix.scale(new THREE.Vector3(1, heightScale, 1));
-            wallInst.setMatrixAt(wi++, matrix);
-        }
-        wallInst.instanceMatrix.needsUpdate = true;
-        scene.add(wallInst);
-        instancedMeshes.push(wallInst);
-    }
-
-    // Attach the instanced meshes to the chunk for later reference / disposal
+  const instancedMeshes = [];
+  if (visibleCount === 0) {
     chunk.instancedMeshes = instancedMeshes;
+    chunk.surfaceBlocks = [];
+    return;
+  }
+
+  const instanced = new THREE.InstancedMesh(tileGeom, voxelMat, visibleCount);
+  instanced.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+
+  const matrix = new THREE.Matrix4();
+  const blockPositions = new Array(visibleCount);
+  let i = 0;
+
+  for (let z = 0; z < chunkSize; z++) {
+    for (let y = 0; y < chunkHeight; y++) {
+      for (let x = 0; x < chunkSize; x++) {
+        const index = voxelIndex(x, y, z, chunkSize, chunkHeight);
+        const blockId = chunk.blocks[index];
+        if (!isSolid(blockId)) continue;
+        if (!hasExposedFace(chunk, x, y, z)) continue;
+
+        const wx = chunk.cx * chunkSize + x;
+        const wz = chunk.cy * chunkSize + z;
+
+        matrix.identity();
+        matrix.setPosition(wx, y, wz);
+        instanced.setMatrixAt(i, matrix);
+        instanced.setColorAt(i, colorForBlock(chunk, x, y, z, blockId));
+
+        blockPositions[i] = { x, y, z, wx, wz };
+        i++;
+      }
+    }
+  }
+
+  instanced.instanceMatrix.needsUpdate = true;
+  if (instanced.instanceColor) instanced.instanceColor.needsUpdate = true;
+  instanced.userData.chunk = chunk;
+  instanced.userData.blockPositions = blockPositions;
+
+  scene.add(instanced);
+  instancedMeshes.push(instanced);
+
+  chunk.instancedMeshes = instancedMeshes;
+  chunk.surfaceBlocks = blockPositions;
 }
 
 export function disposeChunkMeshes(scene, chunk) {
-    if (chunk.instancedMeshes) {
-        for (const m of chunk.instancedMeshes) {
-            if (!m) continue;
-            scene.remove(m);
-            // Do not dispose shared geometry/material here - they are owned by the renderer/scene creator
-        }
-        chunk.instancedMeshes = undefined;
+  if (chunk.instancedMeshes) {
+    for (const m of chunk.instancedMeshes) {
+      if (!m) continue;
+      scene.remove(m);
     }
+    chunk.instancedMeshes = undefined;
+  }
 }
