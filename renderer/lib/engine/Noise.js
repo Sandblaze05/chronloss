@@ -77,18 +77,47 @@ export function fbm2D(x, y, options = {}) {
 
 export function generateHeightAt(col, row, options = {}) {
   const {
-    seed = 0,
-    scale = 16,
-    octaves = 4,
-    persistence = 0.5,
-    lacunarity = 2,
-    minHeight = 0,
-    maxHeight = 3,
+    seed = 0, scale = 16, octaves = 4, persistence = 0.5,
+    lacunarity = 2, minHeight = 0, maxHeight = 3, blockHeight = 1,
+    exponent = 1.0
   } = options;
 
-  const n = fbm2D(col, row, { seed, scale, octaves, persistence, lacunarity });
+  let n = fbm2D(col, row, { seed, scale, octaves, persistence, lacunarity });
+  n = Math.pow(n, exponent); 
 
-  // Map normalized noise [0,1] to discrete integer height in [minHeight, maxHeight]
-  const h = Math.round(minHeight + n * (maxHeight - minHeight));
-  return h;
+  // Map normalized noise [0,1] to discrete integer block count
+  const blocks = Math.round(minHeight + n * (maxHeight - minHeight));
+  return blocks * blockHeight;
+}
+
+// Determine a biome type at a given world column/row using height + moisture
+// normalizedHeight should be in [0,1] (the raw FBM value before remapping to blocks)
+export function generateBiomeAt(col, row, normalizedHeight, options = {}) {
+  const opts = { ...(options || {}) };
+  const baseSeed = opts.seed || 0;
+
+  // Use a different seed so moisture patterns are decorrelated from height
+  const moistureSeed = (typeof baseSeed === 'number') ? (baseSeed + 1337) : `${baseSeed}_1337`;
+
+  // Moisture usually looks better with a larger scale (wider weather patterns)
+  const moisture = fbm2D(col, row, {
+    ...opts,
+    seed: moistureSeed,
+    scale: (opts.scale || 8) * 2,
+  });
+
+  // Biome lookup using normalized height in [0,1]
+  if (normalizedHeight < 0.2) {
+    return 'water';
+  }
+  if (normalizedHeight < 0.25) {
+    return 'sand';
+  }
+  if (normalizedHeight > 0.8) {
+    return moisture > 0.5 ? 'snow' : 'stone';
+  }
+
+  if (moisture < 0.3) return 'desert';
+  if (moisture < 0.6) return 'grass';
+  return 'forest';
 }

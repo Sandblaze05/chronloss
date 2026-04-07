@@ -1,15 +1,16 @@
-export const tileSize = 2;
+export const tileSize = 1;
 
+// Orthogonal grid: each tile is a 1x1 block in world-space.
 export function gridToWorld(col, row, tileW = tileSize, tileH = tileSize) {
-  const x = (col - row) * (tileW / 2);
-  const z = (col + row) * (tileH / 2);
+  const x = col * tileW;
+  const z = row * tileH;
   return { x, z };
 }
 
-// worldToGrid returns local (centered) grid coords (floats)
+// worldToGrid returns local grid coords (floats)
 export function worldToGrid(world) {
-  const s = tileSize / 2;
-  const colLocal = (world.x / s + world.z / s) / 2;
-  const rowLocal = (world.z / s - world.x / s) / 2;
+  const s = tileSize;
+  const colLocal = world.x / s;
+  const rowLocal = world.z / s;
   return { c: colLocal, r: rowLocal };
 }

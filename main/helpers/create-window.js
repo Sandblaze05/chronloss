@@ -72,6 +72,13 @@ export const createWindow = (windowName, options) => {
     },
   })
 
+  // Ensure the window is always maximized and prevent user from leaving maximized state
+  win.maximize()
+  win.on('unmaximize', () => {
+    win.maximize()
+  })
+
+  // Persist state when closing (saveState already avoids saving when maximized)
   win.on('close', saveState)
 
   return win

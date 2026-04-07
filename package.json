@@ -7,7 +7,7 @@
   "type": "module",
   "main": "app/main.js",
   "scripts": {
-    "dev": "nextron",
+    "dev": "nextron --run-only --startup-delay 2000 --renderer-port 3000",
     "build": "nextron build",
     "postinstall": "electron-builder install-app-deps"
   },

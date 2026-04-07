@@ -5,12 +5,13 @@ export const CHUNK_SIZE = 16;
 
 export const DEFAULT_WORLD_OPTIONS = {
   seed: 0,
-  scale: 16,
+  scale: 40,
   octaves: 4,
   persistence: 0.5,
   lacunarity: 2,
   minHeight: 0,
-  maxHeight: 3,
+  maxHeight: 20,
+  blockHeight: 1, // dont change
 };
 
 export function generateWorld(width, height, options = {}) {

@@ -1,5 +1,5 @@
 import Head from "next/head";
-import { Geist, Geist_Mono, Poppins } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import "../styles/globals.css";
 
 const geistSans = Geist({
@@ -12,12 +12,6 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const poppins = Poppins({
-  variable: "--font-poppins",
-  subsets: ["latin"],
-  weight: ["300", "400", "500", "600", "700"],
-});
-
 export default function App({ Component, pageProps }) {
   return (
     <>
@@ -28,7 +22,7 @@ export default function App({ Component, pageProps }) {
       </Head>
 
       <main
-        className={`${geistSans.variable} ${geistMono.variable} ${poppins.variable}`}
+        className={`${geistSans.variable} ${geistMono.variable}`}
       >
           <Component {...pageProps} />
       </main>
