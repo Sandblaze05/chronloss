@@ -1,5 +1,3 @@
-'use client'
-
 export const tileSize = 2;
 
 export function gridToWorld(col, row, tileW = tileSize, tileH = tileSize) {

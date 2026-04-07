@@ -1,5 +1,3 @@
-'use client'
-
 // Simple seeded value-noise / FBM helper for deterministic heightmaps
 // Exports:
 // - generateHeightAt(col, row, options)

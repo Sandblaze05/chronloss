@@ -1,5 +1,3 @@
-'use client'
-
 import * as THREE from 'three';
 import { gridToWorld } from './GridMath.js';
 

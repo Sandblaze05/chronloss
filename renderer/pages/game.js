@@ -1,12 +1,10 @@
-'use client'
-
 import React, { useEffect, useRef } from 'react'
 import * as THREE from 'three'
-import { CHUNK_SIZE, createChunk, chunkKey } from './World.js';
-import { buildChunkMeshes, disposeChunkMeshes, getTileMeshes } from './Renderer.js';
-import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from './GridMath.js';
+import { CHUNK_SIZE, createChunk, chunkKey } from '../lib/engine/World.js';
+import { buildChunkMeshes, disposeChunkMeshes, getTileMeshes } from '../lib/engine/Renderer.js';
+import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from '../lib/engine/GridMath.js';
 
-const Page = () => {
+const GamePage = () => {
 
   const ref = useRef(null);
 
@@ -17,7 +15,8 @@ const Page = () => {
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    console.log(window.innerWidth, window.innerHeight)
     renderer.domElement.style.display = 'block';
     container.appendChild(renderer.domElement);
 
@@ -307,10 +306,15 @@ const Page = () => {
   return (
     <div
       ref={ref}
-      className='w-screen h-screen bg-black'
+      style={{
+        position: 'fixed',
+        inset: 0,
+        margin: 0,
+        overflow: 'hidden'
+      }}
     />
   );
 
 }
 
-export default Page;
+export default GamePage;

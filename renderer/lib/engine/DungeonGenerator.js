@@ -1,5 +1,3 @@
-'use client'
-
 // simple dungeon generator placeholder
 // marks border tiles as walls
 

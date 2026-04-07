@@ -1,5 +1,3 @@
-'use client'
-
 import { createTile } from './Tile.js';
 import { generateHeightAt } from './Noise.js';
 
