@@ -539,13 +539,11 @@ const GamePage = () => {
 
     let playerIndex = -1;
     let useIpcEcs = !!(ipc && typeof ipc.invoke === 'function' && typeof ipc.send === 'function');
-    const ecsState = { x: playerWorld.x, y: 1, z: playerWorld.z };
     const localVelocity = { x: 0, y: 0, z: 0 };
     let localVerticalVelocity = 0;
     let unsubscribeEcs = null;
     let lastSentVelocity = { x: 0, y: 0, z: 0 };
     let lastVelocitySendTime = 0;
-    const ECS_POSITION_SMOOTHING = 0.35;
 
     if (useIpcEcs) {
       ipc.invoke('ecs:init', {
@@ -553,26 +551,10 @@ const GamePage = () => {
       }).then((result) => {
         if (!result) return;
         playerIndex = Number(result.index) || 0;
-        if (result.position) {
-          ecsState.x = Number(result.position.x) || 0;
-          ecsState.y = Number(result.position.y) || 1;
-          ecsState.z = Number(result.position.z) || 0;
-          playerWorld.x = ecsState.x;
-          playerWorld.y = ecsState.y;
-          playerWorld.z = ecsState.z;
-        }
       }).catch((error) => {
         console.warn('ecs:init failed, falling back to local integration:', error);
         useIpcEcs = false;
         playerIndex = 0;
-      });
-
-      unsubscribeEcs = ipc.on('ecs:state', (packet) => {
-        if (!packet || (typeof packet.index === 'number' && packet.index !== playerIndex)) return;
-        const pos = packet.position || {};
-        ecsState.x = Number(pos.x) || 0;
-        ecsState.y = Number(pos.y) || 1;
-        ecsState.z = Number(pos.z) || 0;
       });
     } else {
       playerIndex = 0;
@@ -658,6 +640,23 @@ const GamePage = () => {
       return false;
     }
 
+    function tryMoveWithStepUp(position, axis, delta) {
+      if (Math.abs(delta) < 1e-7) return false;
+
+      const steppedPosition = { x: position.x, y: position.y + 1, z: position.z };
+      if (collidesAabb(steppedPosition.x, steppedPosition.y, steppedPosition.z)) {
+        return false;
+      }
+
+      const blocked = moveAlongAxis(steppedPosition, axis, delta);
+      if (blocked) return false;
+
+      position.x = steppedPosition.x;
+      position.y = steppedPosition.y;
+      position.z = steppedPosition.z;
+      return true;
+    }
+
     function resolvePenetrationUp(position, maxLift = CHUNK_HEIGHT + 2) {
       if (!collidesAabb(position.x, position.y, position.z)) return true;
       for (let i = 0; i < maxLift; i++) {
@@ -731,11 +730,6 @@ const GamePage = () => {
       playerPrevWorld.z = playerWorld.z;
       playerPrevWorld.y = playerWorld.y;
 
-      if (useIpcEcs) {
-        playerWorld.x = THREE.MathUtils.lerp(playerWorld.x, ecsState.x, ECS_POSITION_SMOOTHING);
-        playerWorld.z = THREE.MathUtils.lerp(playerWorld.z, ecsState.z, ECS_POSITION_SMOOTHING);
-      }
-
       if (!spawnHeightInitialized) {
         const spawnY = getSurfaceCenterYAtWorld(playerWorld.x, playerWorld.z);
         if (spawnY !== null) {
@@ -766,38 +760,35 @@ const GamePage = () => {
       const desiredDx = vWorld.x * dt;
       const desiredDz = vWorld.z * dt;
 
-      const testPos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
-      moveAlongAxis(testPos, 'x', desiredDx);
-      moveAlongAxis(testPos, 'z', desiredDz);
-      const resolvedVx = (testPos.x - playerWorld.x) / moveDt;
-      const resolvedVz = (testPos.z - playerWorld.z) / moveDt;
+      const movePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
+      if (moveAlongAxis(movePos, 'x', desiredDx)) {
+        tryMoveWithStepUp(movePos, 'x', desiredDx);
+      }
+      if (moveAlongAxis(movePos, 'z', desiredDz)) {
+        tryMoveWithStepUp(movePos, 'z', desiredDz);
+      }
+
+      const resolvedVx = (movePos.x - playerWorld.x) / moveDt;
+      const resolvedVz = (movePos.z - playerWorld.z) / moveDt;
 
       if (useIpcEcs) {
-        const vx = resolvedVx;
-        const vz = resolvedVz;
-
         const now = performance.now();
         const changed =
-          Math.abs(vx - lastSentVelocity.x) > 0.0001 ||
-          Math.abs(vz - lastSentVelocity.z) > 0.0001;
+          Math.abs(resolvedVx - lastSentVelocity.x) > 0.0001 ||
+          Math.abs(resolvedVz - lastSentVelocity.z) > 0.0001;
         if (changed || now - lastVelocitySendTime > 120) {
-          ipc.send('ecs:setVelocity', { index: playerIndex, vx, vy: 0, vz });
-          lastSentVelocity = { x: vx, y: 0, z: vz };
+          ipc.send('ecs:setVelocity', { index: playerIndex, vx: resolvedVx, vy: 0, vz: resolvedVz });
+          lastSentVelocity = { x: resolvedVx, y: 0, z: resolvedVz };
           lastVelocitySendTime = now;
         }
-      } else {
-        localVelocity.x = resolvedVx;
-        localVelocity.z = resolvedVz;
       }
 
-      if (!useIpcEcs) {
-        const movePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
-        moveAlongAxis(movePos, 'x', localVelocity.x * dt);
-        moveAlongAxis(movePos, 'z', localVelocity.z * dt);
+      localVelocity.x = resolvedVx;
+      localVelocity.z = resolvedVz;
 
-        playerWorld.x = movePos.x;
-        playerWorld.z = movePos.z;
-      }
+      playerWorld.x = movePos.x;
+      playerWorld.y = movePos.y;
+      playerWorld.z = movePos.z;
 
       const verticalPos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
       if (resolvePenetrationUp(verticalPos)) {
