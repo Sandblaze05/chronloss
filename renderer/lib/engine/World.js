@@ -19,12 +19,12 @@ export const BLOCK_IDS = {
 export const DEFAULT_WORLD_OPTIONS = {
   seed: 0,
   chunkHeight: CHUNK_HEIGHT,
-  scale: 40,
+  scale: 150,
   octaves: 4,
   persistence: 0.5,
   lacunarity: 2,
   minHeight: 0,
-  maxHeight: 20,
+  maxHeight: 100,
   blockHeight: 1, // dont change
   caveScale: 24,
   caveOctaves: 3,

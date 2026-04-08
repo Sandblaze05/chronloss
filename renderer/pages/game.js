@@ -1,9 +1,10 @@
 import React, { useEffect, useRef } from 'react'
 import * as THREE from 'three'
-import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, chunkArrayLength, chunkKey, DEFAULT_WORLD_OPTIONS, getVoxel, setVoxel, voxelIndex } from '../lib/engine/World.js';
+import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, chunkKey, DEFAULT_WORLD_OPTIONS, getVoxel, setVoxel } from '../lib/engine/World.js';
 import { buildChunkMeshes, disposeChunkMeshes } from '../lib/engine/Renderer.js';
 import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from '../lib/engine/GridMath.js';
-import { fbm2D, fbm3D, generateBiomeAt } from '../lib/engine/Noise.js';
+import { generateChunkData } from '../lib/engine/ChunkGeneration.js';
+import { collidesAabb, moveAlongAxis, moveWithStepUp, resolvePenetrationUp } from '../lib/engine/PlayerPhysics.js';
 
 const idToBlock = (id) => {
   switch (id) {
@@ -140,60 +141,6 @@ const GamePage = () => {
       };
     }
 
-    function generateChunkDataSync(cx, cy, chunkSize, chunkHeight, options) {
-      const opts = { ...DEFAULT_WORLD_OPTIONS, ...(options || {}) };
-      const localChunkHeight = Number(chunkHeight || opts.chunkHeight) || CHUNK_HEIGHT;
-      const blocks = new Uint8Array(chunkArrayLength(chunkSize, localChunkHeight));
-      const startC = cx * chunkSize;
-      const startR = cy * chunkSize;
-      for (let z = 0; z < chunkSize; z++) {
-        for (let x = 0; x < chunkSize; x++) {
-          const col = startC + x;
-          const row = startR + z;
-          let n = fbm2D(col, row, opts);
-          n = Math.pow(n, opts.exponent || 1.0);
-          const surfaceY = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0)));
-
-          const biomeStr = generateBiomeAt(col, row, n, opts);
-          let surfaceBlockId = BLOCK_IDS.GRASS;
-          if (biomeStr === 'water') surfaceBlockId = BLOCK_IDS.WATER;
-          if (biomeStr === 'sand') surfaceBlockId = BLOCK_IDS.SAND;
-          if (biomeStr === 'snow') surfaceBlockId = BLOCK_IDS.SNOW;
-          if (biomeStr === 'desert') surfaceBlockId = BLOCK_IDS.DESERT;
-          if (biomeStr === 'forest') surfaceBlockId = BLOCK_IDS.FOREST;
-
-          const caveSeed = typeof opts.seed === 'number' ? opts.seed + 999 : `${opts.seed}_999`;
-          for (let y = 0; y < localChunkHeight; y++) {
-            const index = voxelIndex(x, y, z, chunkSize, localChunkHeight);
-
-            if (y > surfaceY) {
-              blocks[index] = BLOCK_IDS.AIR;
-            } else if (y === surfaceY) {
-              blocks[index] = surfaceBlockId;
-            } else if (y >= surfaceY - 3) {
-              if (surfaceBlockId === BLOCK_IDS.SAND || surfaceBlockId === BLOCK_IDS.DESERT) {
-                blocks[index] = BLOCK_IDS.SAND;
-              } else {
-                blocks[index] = BLOCK_IDS.DIRT;
-              }
-            } else {
-              const caveDensity = fbm3D(col, y, row, {
-                seed: caveSeed,
-                scale: opts.caveScale,
-                octaves: opts.caveOctaves,
-              });
-              if (caveDensity < (opts.caveThreshold || 0.3)) {
-                blocks[index] = BLOCK_IDS.AIR;
-              } else {
-                blocks[index] = BLOCK_IDS.STONE;
-              }
-            }
-          }
-        }
-      }
-      return { chunkHeight: localChunkHeight, blocks };
-    }
-
     function requestIpcChunkBatch(batch) {
       if (!batch.length) return;
 
@@ -226,7 +173,7 @@ const GamePage = () => {
             const key = chunkKey(item.cx, item.cy);
             pendingChunkKeys.delete(key);
             if (!loadQueueSet.has(key) && !activeChunks.has(key)) continue;
-            const data = generateChunkDataSync(item.cx, item.cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
+            const data = generateChunkData(item.cx, item.cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
             generatedChunkQueue.push({
               cx: item.cx,
               cy: item.cy,
@@ -271,7 +218,7 @@ const GamePage = () => {
           }
 
           pendingChunkKeys.add(key);
-          const data = generateChunkDataSync(cx, cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
+          const data = generateChunkData(cx, cy, CHUNK_SIZE, CHUNK_HEIGHT, DEFAULT_WORLD_OPTIONS);
           pendingChunkKeys.delete(key);
 
           if (!loadQueueSet.has(key) && !activeChunks.has(key)) {
@@ -601,71 +548,6 @@ const GamePage = () => {
       return PLAYER_HALF_HEIGHT + FOOT_CLEARANCE;
     }
 
-    function collidesAabb(centerX, centerY, centerZ) {
-      const epsilon = 1e-4;
-      const minX = Math.floor((centerX - PLAYER_HALF_WIDTH) + epsilon);
-      const maxX = Math.floor((centerX + PLAYER_HALF_WIDTH) - epsilon);
-      const minY = Math.floor((centerY - PLAYER_HALF_HEIGHT) + epsilon);
-      const maxY = Math.floor((centerY + PLAYER_HALF_HEIGHT) - epsilon);
-      const minZ = Math.floor((centerZ - PLAYER_HALF_WIDTH) + epsilon);
-      const maxZ = Math.floor((centerZ + PLAYER_HALF_WIDTH) - epsilon);
-
-      for (let y = minY; y <= maxY; y++) {
-        for (let z = minZ; z <= maxZ; z++) {
-          for (let x = minX; x <= maxX; x++) {
-            if (getVoxelAtWorld(x, y, z) > BLOCK_IDS.AIR) return true;
-          }
-        }
-      }
-      return false;
-    }
-
-    function moveAlongAxis(position, axis, delta) {
-      if (Math.abs(delta) < 1e-7) return false;
-
-      const maxStep = 0.2;
-      const steps = Math.max(1, Math.ceil(Math.abs(delta) / maxStep));
-      const stepDelta = delta / steps;
-
-      for (let i = 0; i < steps; i++) {
-        const nextX = axis === 'x' ? position.x + stepDelta : position.x;
-        const nextY = axis === 'y' ? position.y + stepDelta : position.y;
-        const nextZ = axis === 'z' ? position.z + stepDelta : position.z;
-        if (collidesAabb(nextX, nextY, nextZ)) return true;
-        position.x = nextX;
-        position.y = nextY;
-        position.z = nextZ;
-      }
-
-      return false;
-    }
-
-    function tryMoveWithStepUp(position, axis, delta) {
-      if (Math.abs(delta) < 1e-7) return false;
-
-      const steppedPosition = { x: position.x, y: position.y + 1, z: position.z };
-      if (collidesAabb(steppedPosition.x, steppedPosition.y, steppedPosition.z)) {
-        return false;
-      }
-
-      const blocked = moveAlongAxis(steppedPosition, axis, delta);
-      if (blocked) return false;
-
-      position.x = steppedPosition.x;
-      position.y = steppedPosition.y;
-      position.z = steppedPosition.z;
-      return true;
-    }
-
-    function resolvePenetrationUp(position, maxLift = CHUNK_HEIGHT + 2) {
-      if (!collidesAabb(position.x, position.y, position.z)) return true;
-      for (let i = 0; i < maxLift; i++) {
-        position.y += 1;
-        if (!collidesAabb(position.x, position.y, position.z)) return true;
-      }
-      return false;
-    }
-
     function getChunkByWorldVoxel(wx, wz) {
       const cx = Math.floor(wx / CHUNK_SIZE);
       const cy = Math.floor(wz / CHUNK_SIZE);
@@ -722,10 +604,7 @@ const GamePage = () => {
     // decoupled look-at tracking vector (smoothed separately from camera position)
     const currentLookAt = new THREE.Vector3(playerWorld.x, playerWorld.y, playerWorld.z);
 
-    // ECS runs in the main process via IPC. Smooth snapshots before rendering.
-
     function physicsStep(dt) {
-      // copy current to prev for interpolation
       playerPrevWorld.x = playerWorld.x;
       playerPrevWorld.z = playerWorld.z;
       playerPrevWorld.y = playerWorld.y;
@@ -740,7 +619,6 @@ const GamePage = () => {
         }
       }
 
-      // Compute desired velocity from input and write into shared buffer
       let inC = 0, inR = 0;
       if (keys.w) { inC -= 1; inR -= 1; }
       if (keys.s) { inC += 1; inR += 1; }
@@ -761,12 +639,8 @@ const GamePage = () => {
       const desiredDz = vWorld.z * dt;
 
       const movePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
-      if (moveAlongAxis(movePos, 'x', desiredDx)) {
-        tryMoveWithStepUp(movePos, 'x', desiredDx);
-      }
-      if (moveAlongAxis(movePos, 'z', desiredDz)) {
-        tryMoveWithStepUp(movePos, 'z', desiredDz);
-      }
+      moveWithStepUp(getVoxelAtWorld, movePos, 'x', desiredDx, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT);
+      moveWithStepUp(getVoxelAtWorld, movePos, 'z', desiredDz, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT);
 
       const resolvedVx = (movePos.x - playerWorld.x) / moveDt;
       const resolvedVz = (movePos.z - playerWorld.z) / moveDt;
@@ -791,11 +665,11 @@ const GamePage = () => {
       playerWorld.z = movePos.z;
 
       const verticalPos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
-      if (resolvePenetrationUp(verticalPos)) {
+      if (resolvePenetrationUp(getVoxelAtWorld, verticalPos, CHUNK_HEIGHT + 2, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT)) {
         playerWorld.y = verticalPos.y;
       }
 
-      const grounded = collidesAabb(playerWorld.x, playerWorld.y - 0.06, playerWorld.z);
+      const grounded = collidesAabb(getVoxelAtWorld, playerWorld.x, playerWorld.y - 0.06, playerWorld.z, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT);
       if (!grounded) {
         localVerticalVelocity = Math.max(localVerticalVelocity - GRAVITY * dt, -TERMINAL_FALL_SPEED);
       } else if (localVerticalVelocity < 0) {
@@ -804,7 +678,7 @@ const GamePage = () => {
 
       localVelocity.y = localVerticalVelocity;
       const yMovePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
-      const blockedY = moveAlongAxis(yMovePos, 'y', localVelocity.y * dt);
+      const blockedY = moveAlongAxis(getVoxelAtWorld, yMovePos, 'y', localVelocity.y * dt, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT);
       if (blockedY && localVelocity.y < 0) {
         localVerticalVelocity = 0;
       }
