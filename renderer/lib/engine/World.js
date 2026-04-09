@@ -14,23 +14,53 @@ export const BLOCK_IDS = {
   SNOW: 6,
   DESERT: 7,
   FOREST: 8,
+  LAVA: 9,
 };
 
 export const DEFAULT_WORLD_OPTIONS = {
   seed: 0,
   chunkHeight: CHUNK_HEIGHT,
-  scale: 150,
+  seaLevel: Math.floor(CHUNK_HEIGHT * 0.47),
+  scale: 150, // Larger scale works better with domain warping and multi-layer noise
+  continentScale: 1200,
+  mountainMaskScale: 540,
+  continentAmplitude: 0.62,
+  hillAmplitude: 0.18,
+  mountainAmplitude: 0.85,
+  detailAmplitude: 0.04,
+  mountainBoost: 0.75,
+  terrainHeightBias: -0.12,
+  cliffAmplitude: 0.18,
+  crackAmplitude: 0.12,
+  cliffTerraceSteps: 12,
+  cliffTerraceStrength: 0.12,
+  mountainArchOpeningChance: 0.012,
   octaves: 4,
   persistence: 0.5,
   lacunarity: 2,
   minHeight: 0,
-  maxHeight: 100,
+  maxHeight: CHUNK_HEIGHT - 2,
   blockHeight: 1, // dont change
   caveScale: 24,
   caveOctaves: 3,
   cavePersistence: 0.5,
   caveLacunarity: 2,
   caveThreshold: 0.3,
+  caveMinSurfaceCover: 1,
+  caveMinSurfaceCoverMountain: 4,
+  surfaceOpeningChance: 0.06,
+  surfaceOpeningMountainCutoff: 0.52,
+  surfaceOpeningMinSlope: 0.30,
+  surfaceOpeningMaxSlope: 0.55,
+  surfaceOpeningMaxHeight01: 0.72,
+  topSoilDepth: 1,
+  biomeAltitudeCooling: 0.28,
+  deepWaterLevel: 0.14,
+  waterLevel: 0.21,
+  shorelineLevel: 0.27,
+  useErosion: true, // Enable erosion approximation
+  useReshape: true, // Enable height curve reshaping
+  exponent: 1.1, // Slight upward curve for more interesting landforms
 };
 
 export function chunkArrayLength(chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT) {

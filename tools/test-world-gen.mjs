@@ -1,5 +1,21 @@
-import { CHUNK_SIZE, DEFAULT_WORLD_OPTIONS } from '../renderer/lib/engine/World.js';
-import { fbm2D, generateBiomeAt } from '../renderer/lib/engine/Noise.js';
+import { BLOCK_IDS, CHUNK_SIZE, DEFAULT_WORLD_OPTIONS, voxelIndex } from '../renderer/lib/engine/World.js';
+import { generateChunkData } from '../renderer/lib/engine/ChunkGeneration.js';
+
+function charForBlock(blockId) {
+  switch (blockId) {
+    case BLOCK_IDS.AIR: return ' ';
+    case BLOCK_IDS.STONE: return '#';
+    case BLOCK_IDS.DIRT: return 'd';
+    case BLOCK_IDS.GRASS: return 'g';
+    case BLOCK_IDS.SAND: return 's';
+    case BLOCK_IDS.WATER: return '~';
+    case BLOCK_IDS.SNOW: return '^';
+    case BLOCK_IDS.DESERT: return 'D';
+    case BLOCK_IDS.FOREST: return 'F';
+    case BLOCK_IDS.LAVA: return 'L';
+    default: return '?';
+  }
+}
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -15,52 +31,57 @@ async function main() {
 
   console.log(`Generating chunk at cx=${cx}, cy=${cy}, size=${chunkSize}, seed=${opts.seed}`);
 
-  const heights = new Array(chunkSize * chunkSize);
-  const biomes = new Array(chunkSize * chunkSize);
+  const localChunkHeight = Number(opts.chunkHeight || DEFAULT_WORLD_OPTIONS.chunkHeight);
+  const { blocks } = generateChunkData(cx, cy, chunkSize, localChunkHeight, opts);
 
-  let i = 0;
-  for (let r = 0; r < chunkSize; r++) {
-    for (let c = 0; c < chunkSize; c++) {
-      const col = cx * chunkSize + c;
-      const row = cy * chunkSize + r;
-      let n = fbm2D(col, row, opts);
-      n = Math.pow(n, opts.exponent || 1.0);
-      const h = Math.round((opts.minHeight || 0) + n * ((opts.maxHeight || 3) - (opts.minHeight || 0))) * (opts.blockHeight || 1);
-      heights[i] = h;
-      biomes[i] = generateBiomeAt(col, row, n, opts);
-      i++;
+  const topHeights = new Array(chunkSize * chunkSize).fill(-1);
+  const topBlocks = new Array(chunkSize * chunkSize).fill(BLOCK_IDS.AIR);
+  let waterVoxels = 0;
+
+  for (let z = 0; z < chunkSize; z++) {
+    for (let x = 0; x < chunkSize; x++) {
+      const colIdx = z * chunkSize + x;
+      let topY = -1;
+      let topBlock = BLOCK_IDS.AIR;
+      for (let y = localChunkHeight - 1; y >= 0; y--) {
+        const idx = voxelIndex(x, y, z, chunkSize, localChunkHeight);
+        const block = blocks[idx];
+        if (block === BLOCK_IDS.WATER) waterVoxels++;
+        if (topY === -1 && block !== BLOCK_IDS.AIR) {
+          topY = y;
+          topBlock = block;
+        }
+      }
+
+      topHeights[colIdx] = topY;
+      topBlocks[colIdx] = topBlock;
     }
   }
 
-  // Print heights grid
-  console.log('\nHeights:');
-  for (let r = 0; r < chunkSize; r++) {
+  console.log('\nTop Surface Height Map:');
+  for (let z = 0; z < chunkSize; z++) {
     const row = [];
-    for (let c = 0; c < chunkSize; c++) {
-      const v = heights[r * chunkSize + c];
-      row.push(String(v).padStart(3, ' '));
+    for (let x = 0; x < chunkSize; x++) {
+      const y = topHeights[z * chunkSize + x];
+      row.push(String(y).padStart(3, ' '));
     }
     console.log(row.join(' '));
   }
 
-  // Print biomes grid (single-letter legend)
-  const legend = { water: 'W', sand: 'S', grass: 'g', forest: 'F', desert: 'D', stone: 'R', snow: '^' };
-  console.log('\nBiomes:');
-  for (let r = 0; r < chunkSize; r++) {
+  console.log('\nTop Surface Material Map:');
+  for (let z = 0; z < chunkSize; z++) {
     const row = [];
-    for (let c = 0; c < chunkSize; c++) {
-      const b = biomes[r * chunkSize + c] || '?';
-      row.push(legend[b] || '?');
+    for (let x = 0; x < chunkSize; x++) {
+      row.push(charForBlock(topBlocks[z * chunkSize + x]));
     }
     console.log(row.join(''));
   }
 
-  // Count biomes
-  const counts = {};
-  for (const b of biomes) counts[b] = (counts[b] || 0) + 1;
-
-  console.log('\nBiome counts:');
-  for (const [k, v] of Object.entries(counts)) console.log(`${k}: ${v}`);
+  const totalVoxels = chunkSize * chunkSize * localChunkHeight;
+  const waterRatio = totalVoxels > 0 ? (waterVoxels / totalVoxels) : 0;
+  console.log('\nMetrics:');
+  console.log(`Sea level: ${opts.seaLevel ?? Math.floor(localChunkHeight * 0.28)}`);
+  console.log(`Water voxels: ${waterVoxels} (${(waterRatio * 100).toFixed(2)}%)`);
 
   console.log('\nDone.');
 }

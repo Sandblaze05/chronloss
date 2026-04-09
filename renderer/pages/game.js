@@ -3,7 +3,8 @@ import * as THREE from 'three'
 import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, chunkKey, DEFAULT_WORLD_OPTIONS, getVoxel, setVoxel } from '../lib/engine/World.js';
 import { buildChunkMeshes, disposeChunkMeshes } from '../lib/engine/Renderer.js';
 import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from '../lib/engine/GridMath.js';
-import { generateChunkData } from '../lib/engine/ChunkGeneration.js';
+import { generateChunkData, sampleTerrainDebug } from '../lib/engine/ChunkGeneration.js';
+import { generateBiomeAt } from '../lib/engine/Noise.js';
 import { collidesAabb, moveAlongAxis, moveWithStepUp, resolvePenetrationUp } from '../lib/engine/PlayerPhysics.js';
 
 const idToBlock = (id) => {
@@ -65,13 +66,25 @@ const GamePage = () => {
     debugPanel.textContent = 'debug hud: initializing...';
     container.appendChild(debugPanel);
 
-    const aspect = container.clientWidth / container.clientHeight;
-    const d = 20;
-    const camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 0.1, 1000);
-    camera.position.set(20, 20, 20);
+    const camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1200);
+    camera.position.set(12, 10, 12);
     camera.lookAt(0, 0, 0);
-    // camera offset relative to player world position
-    const cameraOffset = { x: 20, y: 20, z: 20 };
+    const orbitState = {
+      yaw: Math.PI * 0.25,
+      pitch: 0.42,
+      distance: 14,
+      targetDistance: 14,
+      dragging: false,
+      lastPointerX: 0,
+      lastPointerY: 0,
+    };
+    let mouseAccumX = 0;
+    let mouseAccumY = 0;
+    const MOUSE_SENS = 0.0025;
+    const ZOOM_SENS = 0.012;
+    const MIN_DISTANCE = 6;
+    const MAX_DISTANCE = 34;
+    const cameraTarget = new THREE.Vector3(0, 0, 0);
 
     // lighting
     const ambient = new THREE.AmbientLight(0xffffff, 0.9);
@@ -113,6 +126,7 @@ const GamePage = () => {
     const activeChunks = new Set();
     const chunkMeshes = []; // active chunk-level meshes (InstancedMesh) for raycasting
     let hoveredInfo = null;
+    let hoveredBiomeInfo = null;
     const chunkRadius = 3; // load radius in chunks (increase for larger view)
     const loadQueue = [];
     const loadQueueSet = new Set();
@@ -367,19 +381,22 @@ const GamePage = () => {
     // initial player start at 0,0
 
     // player placeholder
+    const PLAYER_WIDTH = 0.78;
+    const PLAYER_HEIGHT = 1.78;
     const cube = new THREE.Mesh(
-      new THREE.BoxGeometry(1, 2, 1),
+      new THREE.BoxGeometry(PLAYER_WIDTH, PLAYER_HEIGHT, PLAYER_WIDTH),
       new THREE.MeshStandardMaterial({ color: 0x00ffcc })
     );
-    const PLAYER_HALF_WIDTH = 0.42;
-    const PLAYER_HALF_HEIGHT = 1;
+    const PLAYER_HALF_WIDTH = PLAYER_WIDTH * 0.5;
+    const PLAYER_HALF_HEIGHT = PLAYER_HEIGHT * 0.5;
     const FOOT_CLEARANCE = 0.04;
     cube.position.y = PLAYER_HALF_HEIGHT + FOOT_CLEARANCE;
     scene.add(cube);
 
     // raycaster for hover / selection
     const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
+    const pointer = new THREE.Vector2(-2, -2);
+    let pointerMoved = false;
 
     function rebuildChunkMesh(chunk) {
       if (!chunk) return;
@@ -399,10 +416,7 @@ const GamePage = () => {
       }
     }
 
-    function getRaycastHit(event) {
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    function getRaycastHit() {
       raycaster.setFromCamera(pointer, camera);
       const intersects = raycaster.intersectObjects(chunkMeshes);
       if (!intersects.length) return null;
@@ -419,24 +433,37 @@ const GamePage = () => {
       return { chunk, block, normal };
     }
 
+    function updatePointerFromEvent(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
     const onPointerMove = (event) => {
-      const hit = getRaycastHit(event);
-      if (hit) {
-        const wx = hit.block.wx;
-        const wz = hit.block.wz;
-        highlightMesh.position.x = wx;
-        highlightMesh.position.z = wz;
-        highlightMesh.position.y = hit.block.y + 1.02;
-        highlightMesh.visible = true;
-        hoveredInfo = { x: wx, y: hit.block.y, z: wz, id: getVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z) };
-      } else {
-        highlightMesh.visible = false;
-        hoveredInfo = null;
+      if (orbitState.dragging) {
+        const dx = event.clientX - orbitState.lastPointerX;
+        const dy = event.clientY - orbitState.lastPointerY;
+        orbitState.lastPointerX = event.clientX;
+        orbitState.lastPointerY = event.clientY;
+        mouseAccumX += dx;
+        mouseAccumY += dy;
       }
+
+      updatePointerFromEvent(event);
+      pointerMoved = true;
     };
 
     const onPointerDown = (event) => {
-      const hit = getRaycastHit(event);
+      if (event.button === 1) {
+        orbitState.dragging = true;
+        orbitState.lastPointerX = event.clientX;
+        orbitState.lastPointerY = event.clientY;
+        event.preventDefault();
+        return;
+      }
+
+      updatePointerFromEvent(event);
+      const hit = getRaycastHit();
       if (!hit) return;
 
       if (event.button === 0) {
@@ -455,10 +482,27 @@ const GamePage = () => {
       }
     };
 
+    const onPointerUp = (event) => {
+      if (event.button === 1) {
+        orbitState.dragging = false;
+      }
+    };
+
+    const onWheel = (event) => {
+      orbitState.targetDistance = THREE.MathUtils.clamp(
+        orbitState.targetDistance + event.deltaY * ZOOM_SENS,
+        MIN_DISTANCE,
+        MAX_DISTANCE
+      );
+      event.preventDefault();
+    };
+
     const onContextMenu = (event) => event.preventDefault();
 
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    renderer.domElement.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
     renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     // keyboard handlers for WASD movement
@@ -603,6 +647,19 @@ const GamePage = () => {
 
     // decoupled look-at tracking vector (smoothed separately from camera position)
     const currentLookAt = new THREE.Vector3(playerWorld.x, playerWorld.y, playerWorld.z);
+    const currentCameraPos = new THREE.Vector3(camera.position.x, camera.position.y, camera.position.z);
+    const cameraOffsetDir = new THREE.Vector3();
+
+    function updateCurrentBiome() {
+      const terrain = sampleTerrainDebug(Math.floor(playerWorld.x), Math.floor(playerWorld.z), DEFAULT_WORLD_OPTIONS);
+      const biome = generateBiomeAt(
+        Math.floor(playerWorld.x),
+        Math.floor(playerWorld.z),
+        terrain.normalizedHeight,
+        { ...DEFAULT_WORLD_OPTIONS, terrain }
+      );
+      hoveredBiomeInfo = { biome, terrain };
+    }
 
     function physicsStep(dt) {
       playerPrevWorld.x = playerWorld.x;
@@ -619,24 +676,44 @@ const GamePage = () => {
         }
       }
 
-      let inC = 0, inR = 0;
-      if (keys.w) { inC -= 1; inR -= 1; }
-      if (keys.s) { inC += 1; inR += 1; }
-      if (keys.a) { inC -= 1; inR += 1; }
-      if (keys.d) { inC += 1; inR -= 1; }
-      const inLen = Math.hypot(inC, inR);
+      updateCurrentBiome();
 
-      let vTilesC = 0, vTilesR = 0;
-      if (inLen > 0) {
-        vTilesC = (inC / inLen) * moveSpeed;
-        vTilesR = (inR / inLen) * moveSpeed;
-      }
+      // Get raw WASD input (-1 to 1)
+      let inputX = 0, inputZ = 0;
+      if (keys.w) inputZ += 1; // Forward
+      if (keys.s) inputZ -= 1; // Backward
+      if (keys.a) inputX -= 1; // Left
+      if (keys.d) inputX += 1; // Right
 
-      const vWorld = gridToWorld(vTilesC, vTilesR);
-
+      const inLen = Math.hypot(inputX, inputZ);
       const moveDt = Math.max(dt, 1e-5);
-      const desiredDx = vWorld.x * dt;
-      const desiredDz = vWorld.z * dt;
+
+      let desiredDx = 0;
+      let desiredDz = 0;
+
+      if (inLen > 0) {
+        // Normalize input so diagonal movement isn't faster
+        inputX /= inLen;
+        inputZ /= inLen;
+
+        // Extract the camera's Forward and Right vectors
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        forward.y = 0; // Flatten to XZ plane so looking up doesn't slow you down
+        forward.normalize();
+
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+        right.y = 0; // Flatten to XZ plane
+        right.normalize();
+
+        // Multiply input by camera directions
+        const moveDir = new THREE.Vector3()
+          .addScaledVector(right, inputX)
+          .addScaledVector(forward, inputZ);
+
+        // Apply speed and delta time
+        desiredDx = moveDir.x * moveSpeed * dt;
+        desiredDz = moveDir.z * moveSpeed * dt;
+      }
 
       const movePos = { x: playerWorld.x, y: playerWorld.y, z: playerWorld.z };
       moveWithStepUp(getVoxelAtWorld, movePos, 'x', desiredDx, PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT);
@@ -725,28 +802,58 @@ const GamePage = () => {
       cube.position.z = visZ;
       cube.position.y = visY;
 
-      // decoupled camera smoothing: slow position trail, faster look-at smoothing
-      const posLerpSpeed = Math.min(1, 4 * frameTime);
+      // third-person orbit camera driven by middle-mouse drag
+      orbitState.yaw += mouseAccumX * MOUSE_SENS;
+      orbitState.pitch = THREE.MathUtils.clamp(
+        orbitState.pitch + mouseAccumY * MOUSE_SENS,
+        0.16,
+        1.05
+      );
+      mouseAccumX = 0;
+      mouseAccumY = 0;
+
       const lookLerpSpeed = Math.min(1, 10 * frameTime);
-
-      // Smoothly trail the camera's position (creates the tilt/lag effect)
-      camera.position.x = THREE.MathUtils.lerp(camera.position.x, visX + cameraOffset.x, posLerpSpeed);
-      camera.position.y = THREE.MathUtils.lerp(camera.position.y, visY + cameraOffset.y, posLerpSpeed);
-      camera.position.z = THREE.MathUtils.lerp(camera.position.z, visZ + cameraOffset.z, posLerpSpeed);
-
-      // Smoothly track the player's visual position with a faster lerp
       currentLookAt.x = THREE.MathUtils.lerp(currentLookAt.x, visX, lookLerpSpeed);
-      currentLookAt.y = THREE.MathUtils.lerp(currentLookAt.y, visY, lookLerpSpeed);
+      currentLookAt.y = THREE.MathUtils.lerp(currentLookAt.y, visY + 0.75, lookLerpSpeed);
       currentLookAt.z = THREE.MathUtils.lerp(currentLookAt.z, visZ, lookLerpSpeed);
 
-      // Apply the smoothed target
+      orbitState.targetDistance = orbitState.targetDistance;
+      orbitState.distance = THREE.MathUtils.lerp(orbitState.distance, orbitState.targetDistance, Math.min(1, 6 * frameTime));
+      cameraOffsetDir.set(
+        Math.cos(orbitState.yaw) * Math.cos(orbitState.pitch),
+        Math.sin(orbitState.pitch),
+        Math.sin(orbitState.yaw) * Math.cos(orbitState.pitch)
+      );
+      currentCameraPos.copy(currentLookAt).addScaledVector(cameraOffsetDir, orbitState.distance);
+      camera.position.x = THREE.MathUtils.lerp(camera.position.x, currentCameraPos.x, Math.min(1, 8 * frameTime));
+      camera.position.y = THREE.MathUtils.lerp(camera.position.y, currentCameraPos.y, Math.min(1, 8 * frameTime));
+      camera.position.z = THREE.MathUtils.lerp(camera.position.z, currentCameraPos.z, Math.min(1, 8 * frameTime));
       camera.lookAt(currentLookAt);
+
+      if (pointerMoved) {
+        const hit = getRaycastHit();
+        if (hit) {
+          const wx = hit.block.wx;
+          const wz = hit.block.wz;
+          highlightMesh.position.x = wx;
+          highlightMesh.position.z = wz;
+          highlightMesh.position.y = hit.block.y + 1.02;
+          highlightMesh.visible = true;
+          hoveredInfo = { x: wx, y: hit.block.y, z: wz, id: getVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z) };
+        } else {
+          highlightMesh.visible = false;
+          hoveredInfo = null;
+        }
+        pointerMoved = false;
+      }
 
       if (now - lastDebugRefresh > 0.15) {
         const expectedInRange = (chunkRadius * 2 + 1) * (chunkRadius * 2 + 1);
         const currentChunk = gridToChunk(playerGrid.c, playerGrid.r);
         debugPanel.textContent = [
           `fps: ${smoothedFps.toFixed(1)}`,
+          hoveredBiomeInfo ? `biome: ${hoveredBiomeInfo.biome}` : `biome: -`,
+          hoveredBiomeInfo ? `terrain: h=${hoveredBiomeInfo.terrain.normalizedHeight.toFixed(3)} slope=${hoveredBiomeInfo.terrain.slope.toFixed(3)} mountain=${hoveredBiomeInfo.terrain.mountainness.toFixed(3)} preset=${hoveredBiomeInfo.terrain.preset}` : `terrain: -`,
           `player chunk: ${currentChunk.cx},${currentChunk.cy}`,
           // show player world-space and grid coordinates for debugging
           `player world: ${playerWorld.x.toFixed(2)},${playerWorld.y.toFixed(2)},${playerWorld.z.toFixed(2)}`,
@@ -772,11 +879,7 @@ const GamePage = () => {
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
-      const a = w / h;
-      camera.left = -d * a;
-      camera.right = d * a;
-      camera.top = d;
-      camera.bottom = -d;
+      camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
@@ -788,6 +891,8 @@ const GamePage = () => {
       window.removeEventListener('resize', onResize);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('wheel', onWheel);
       renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       renderer.dispose();
       container.removeChild(renderer.domElement);

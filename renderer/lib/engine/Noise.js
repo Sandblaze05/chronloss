@@ -21,6 +21,11 @@ function hash2D(x, y, seed) {
   return (n >>> 0) / 4294967295;
 }
 
+// Export hash2D for use in biome blending
+export function hash2D_export(x, y, seed) {
+  return hash2D(x, y, seed);
+}
+
 function fade(t) {
   return t * t * t * (t * (t * 6 - 15) + 10);
 }
@@ -31,6 +36,16 @@ function lerp(a, b, t) {
 
 function clamp01(value) {
   return Math.max(0, Math.min(1, value));
+}
+
+function decorrelatedSeed(seed, salt) {
+  if (typeof seed === 'number') {
+    let n = (seed >>> 0) ^ (salt >>> 0);
+    n = Math.imul(n ^ (n >>> 16), 2246822519) >>> 0;
+    n = Math.imul(n ^ (n >>> 13), 3266489917) >>> 0;
+    return n >>> 0;
+  }
+  return `${seed}_${salt}`;
 }
 
 function grad2D(ix, iy, seed) {
@@ -187,51 +202,209 @@ export function fbm2D(x, y, options = {}) {
   return value / max;
 }
 
-export function generateHeightAt(col, row, options = {}) {
+// Helper: Apply domain warping to coordinates before sampling
+export function warpedSample(col, row, options = {}) {
   const {
-    seed = 0, scale = 16, octaves = 4, persistence = 0.5,
-    lacunarity = 2, minHeight = 0, maxHeight = 3, blockHeight = 1,
-    exponent = 1.0
+    seed = 0,
+    scale = 150,
+    octaves = 4,
+    persistence = 0.5,
+    lacunarity = 2.0,
   } = options;
 
-  let n = fbm2D(col, row, { seed, scale, octaves, persistence, lacunarity });
-  n = Math.pow(n, exponent); 
+  const warpScale = scale * 0.6;
+  const warpStrength = scale * 0.35;
+  const warpSeed = typeof seed === 'number' ? seed : seedToNumber(seed);
+
+  // Sample two offset noise fields to use as warp offsets
+  const wx = fbmPerlin2D(col + 1.7, row + 9.2, {
+    seed: warpSeed + 41,
+    scale: warpScale,
+    octaves: Math.max(2, octaves - 1),
+    persistence,
+    lacunarity,
+  }) * 2 - 1;
+
+  const wy = fbmPerlin2D(col + 8.3, row + 2.8, {
+    seed: warpSeed + 73,
+    scale: warpScale,
+    octaves: Math.max(2, octaves - 1),
+    persistence,
+    lacunarity,
+  }) * 2 - 1;
+
+  // Apply warp, then sample the real heightmap
+  return fbmPerlin2D(
+    col + wx * warpStrength,
+    row + wy * warpStrength,
+    { seed: warpSeed, scale, octaves, persistence, lacunarity }
+  );
+}
+
+// Reshape height curve: flatten oceans, sharpen mountains
+function reshapeHeight(n) {
+  if (n < 0.35) {
+    // Flatten ocean floor
+    return n * 0.3;
+  } else if (n < 0.5) {
+    // Coastal shelf — gradual
+    return lerp(0.105, 0.35, (n - 0.35) / 0.15);
+  } else {
+    // Land — push mountains upward
+    return lerp(0.35, 1.0, Math.pow((n - 0.5) / 0.5, 0.75));
+  }
+}
+
+// Sample terrain with layered noise: continental + ridged + peak
+export function sampleTerrainHeight(col, row, options = {}) {
+  const {
+    seed = 0,
+    scale = 150,
+    octaves = 4,
+    persistence = 0.5,
+    lacunarity = 2.0,
+  } = options;
+
+  const baseSeed = typeof seed === 'number' ? seed : seedToNumber(seed);
+
+  // Continental layer: warped FBM for landmass shape
+  const continental = warpedSample(col, row, { seed: baseSeed, scale, octaves, persistence, lacunarity });
+
+  // Ridged layer: mountain spines
+  const ridged = ridgedPerlin2D(col, row, {
+    seed: baseSeed + 101,
+    scale: scale * 0.5,
+    octaves: Math.max(3, octaves - 1),
+    persistence: 0.52,
+    lacunarity: 2.0,
+    exponent: 2.2,
+  });
+
+  // Peak layer: sharp summits
+  const peak = Math.pow(
+    perlin2D(
+      col / (scale * 0.22),
+      row / (scale * 0.22),
+      baseSeed + 31337
+    ),
+    4.0
+  );
+
+  // Blend layers: continental drives shape, ridges add structure, peaks add drama
+  let h = continental * 0.38 + ridged * 0.44 + peak * 0.18;
+  return clamp01(Math.pow(Math.max(0, h), 1.1));
+}
+
+// Apply erosion approximation: steep slopes lose material
+export function sampleWithErosion(col, row, options = {}) {
+  const h = sampleTerrainHeight(col, row, options);
+  const hR = sampleTerrainHeight(col + 1, row, options);
+  const hD = sampleTerrainHeight(col, row + 1, options);
+
+  const slopeX = Math.abs(h - hR);
+  const slopeY = Math.abs(h - hD);
+  const slope = Math.sqrt(slopeX * slopeX + slopeY * slopeY);
+
+  // Steep slopes lose material → cuts ravines and sharpens cliffs
+  return clamp01(Math.max(0, h - slope * 0.6));
+}
+
+export function generateHeightAt(col, row, options = {}) {
+  const {
+    seed = 0, scale = 150, octaves = 4, persistence = 0.5,
+    lacunarity = 2, minHeight = 0, maxHeight = 3, blockHeight = 1,
+    exponent = 1.1,
+    useErosion = true,
+    useReshape = true,
+  } = options;
+
+  // Sample with domain warping and layered noise
+  let n = sampleTerrainHeight(col, row, { seed, scale, octaves, persistence, lacunarity });
+
+  // Apply erosion approximation if enabled
+  if (useErosion) {
+    n = sampleWithErosion(col, row, { seed, scale, octaves, persistence, lacunarity });
+  }
+
+  // Reshape height curve for distinct zones
+  if (useReshape) {
+    n = reshapeHeight(n);
+  }
+
+  n = Math.pow(n, exponent);
 
   // Map normalized noise [0,1] to discrete integer block count
   const blocks = Math.round(minHeight + n * (maxHeight - minHeight));
   return blocks * blockHeight;
 }
 
-// Determine a biome type at a given world column/row using height + moisture
-// normalizedHeight should be in [0,1] (the raw FBM value before remapping to blocks)
+// Determine a biome type at a given world column/row using Whittaker diagram
+// (temperature vs precipitation/moisture) with altitude modulation
 export function generateBiomeAt(col, row, normalizedHeight, options = {}) {
-  const opts = { ...(options || {}) };
-  const baseSeed = opts.seed || 0;
+  const baseSeed = options.seed ?? 0;
+  const scale = options.scale ?? 150;
+  const terrain = options.terrain ?? {};
+  const ridge = clamp01(terrain.ridged ?? 0);
+  const slope = clamp01(terrain.slope ?? ridge * 0.8);
+  const mountainness = clamp01(terrain.mountainness ?? ((ridge * 0.6) + (Math.max(0, normalizedHeight - 0.65) / 0.35) * 0.4));
+  const altitudeCooling = options.biomeAltitudeCooling ?? 0.28;
 
-  // Use a different seed so moisture patterns are decorrelated from height
-  const moistureSeed = (typeof baseSeed === 'number') ? (baseSeed + 1337) : `${baseSeed}_1337`;
-
-  // Moisture usually looks better with a larger scale (wider weather patterns)
+  // Three independent large-scale noise fields, all decorrelated
   const moisture = fbm2D(col, row, {
-    ...opts,
-    seed: moistureSeed,
-    scale: (opts.scale || 8) * 2,
+    ...options,
+    seed: decorrelatedSeed(baseSeed, 1337),
+    scale: scale * 2.5,
+    octaves: 3,
   });
 
-  // Biome lookup using normalized height in [0,1]
-  if (normalizedHeight < 0.2) {
-    return 'water';
-  }
-  if (normalizedHeight < 0.25) {
-    return 'sand';
-  }
-  if (normalizedHeight > 0.8) {
-    return moisture > 0.5 ? 'snow' : 'stone';
+  const temperature = fbm2D(col, row, {
+    ...options,
+    seed: decorrelatedSeed(baseSeed, 2674),
+    scale: scale * 3.0,
+    octaves: 2,
+  }) - normalizedHeight * altitudeCooling; // altitude lapse rate — mountains are cold
+
+  const deepWaterLevel = options.deepWaterLevel ?? 0.14;
+  const waterLevel = options.waterLevel ?? 0.21;
+  const shorelineLevel = options.shorelineLevel ?? 0.27;
+
+  const isFlat = slope < 0.22 && ridge < 0.42;
+  const isPeak = normalizedHeight > 0.83 || mountainness > 0.72;
+
+  // Water / elevation gates first
+  if (normalizedHeight < deepWaterLevel) return 'deep_water';
+  if (normalizedHeight < waterLevel) return 'water';
+  if (normalizedHeight < shorelineLevel) return moisture > 0.5 ? 'wetland' : 'sand';
+
+  // Polar / high-altitude
+  if (isPeak || temperature < 0.12) {
+    return moisture > 0.4 ? 'snow' : 'stone';
   }
 
-  if (moisture < 0.3) return 'desert';
-  if (moisture < 0.6) return 'grass';
-  return 'forest';
+  // Broad plains in temperate low-slope terrain.
+  if (isFlat && normalizedHeight > 0.30 && normalizedHeight < 0.62) {
+    if (temperature > 0.62) return moisture > 0.36 ? 'savanna' : 'desert';
+    if (temperature > 0.35) return moisture > 0.24 ? 'grass' : 'sand';
+    return moisture > 0.55 ? 'taiga' : 'tundra';
+  }
+
+  // Whittaker diagram: temperature vs moisture
+  if (temperature < 0.30) {
+    // Cold band: polar/arctic
+    if (mountainness > 0.52) return moisture > 0.4 ? 'snow' : 'stone';
+    return moisture > 0.55 ? 'taiga' : 'tundra';
+  }
+  if (temperature < 0.55) {
+    // Temperate band
+    if (moisture > 0.70) return 'temperate_rainforest';
+    if (moisture > 0.45) return 'forest';
+    if (moisture > 0.18) return 'grass';
+    return 'desert';
+  }
+  // Hot band: tropical
+  if (moisture > 0.65) return 'jungle';
+  if (moisture > 0.32) return 'savanna';
+  return 'desert';
 }
 
 function hash3D(x, y, z, seed) {
