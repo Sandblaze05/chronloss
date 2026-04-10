@@ -33,6 +33,108 @@ const idToBlock = (id) => {
   return -1;
 }
 
+function createChunkRequestBuffer(batch, chunkSize) {
+  const buffer = new ArrayBuffer(8 + (batch.length * 8));
+  const view = new DataView(buffer);
+  view.setUint32(0, batch.length, true);
+  view.setUint32(4, chunkSize, true);
+
+  let offset = 8;
+  for (const item of batch) {
+    view.setInt32(offset, Number(item.cx) || 0, true);
+    view.setInt32(offset + 4, Number(item.cy) || 0, true);
+    offset += 8;
+  }
+
+  return new Uint8Array(buffer);
+}
+
+function parseChunkResponseBuffer(payload) {
+  if (!payload) return [];
+
+  const bytes = payload instanceof Uint8Array
+    ? payload
+    : (payload instanceof ArrayBuffer ? new Uint8Array(payload) : null);
+  if (!bytes) return [];
+  if (bytes.byteLength < 8) return [];
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const chunkCount = view.getUint32(4, true);
+  const out = [];
+  let offset = 8;
+
+  for (let i = 0; i < chunkCount; i += 1) {
+    if (offset + 20 > bytes.byteLength) break;
+    const cx = view.getInt32(offset, true);
+    offset += 4;
+    const cy = view.getInt32(offset, true);
+    offset += 4;
+    const chunkSize = view.getUint32(offset, true);
+    offset += 4;
+    const chunkHeight = view.getUint32(offset, true);
+    offset += 4;
+    const blockCount = view.getUint32(offset, true);
+    offset += 4;
+
+    const blockBytes = blockCount * 4;
+    if (offset + blockBytes > bytes.byteLength) break;
+
+    const sourceBlocks = new Uint32Array(bytes.buffer, bytes.byteOffset + offset, blockCount);
+    const blocks = new Uint32Array(blockCount);
+    blocks.set(sourceBlocks);
+    offset += blockBytes;
+
+    out.push({
+      cx,
+      cy,
+      chunkSize,
+      chunkHeight,
+      formatVersion: 2,
+      blocks,
+    });
+  }
+
+  return out;
+}
+
+function createEcsInitRequestBuffer(position) {
+  const buffer = new ArrayBuffer(24);
+  const view = new DataView(buffer);
+  view.setFloat64(0, Number(position?.x) || 0, true);
+  view.setFloat64(8, Number(position?.y) || 1, true);
+  view.setFloat64(16, Number(position?.z) || 0, true);
+  return new Uint8Array(buffer);
+}
+
+function parseEcsInitResponse(payload) {
+  if (!payload) return null;
+
+  if (payload instanceof Uint8Array || payload instanceof ArrayBuffer) {
+    const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+    if (bytes.byteLength < 28) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return {
+      index: view.getInt32(0, true),
+      position: {
+        x: view.getFloat64(4, true),
+        y: view.getFloat64(12, true),
+        z: view.getFloat64(20, true),
+      },
+    };
+  }
+
+  return payload;
+}
+
+function createEcsVelocityBuffer(vx, vy, vz) {
+  const buffer = new ArrayBuffer(12);
+  const view = new DataView(buffer);
+  view.setFloat32(0, Number(vx) || 0, true);
+  view.setFloat32(4, Number(vy) || 0, true);
+  view.setFloat32(8, Number(vz) || 0, true);
+  return new Uint8Array(buffer);
+}
+
 const GamePage = () => {
 
   const ref = useRef(null);
@@ -127,7 +229,7 @@ const GamePage = () => {
     const chunkMeshes = []; // active chunk-level meshes for raycasting
     let hoveredInfo = null;
     let hoveredBiomeInfo = null;
-    const chunkRadius = 5; // load radius in chunks (increase for larger view)
+    const chunkRadius = 3; // load radius in chunks (increase for larger view)
     const loadQueue = [];
     const loadQueueSet = new Set();
     const generatedChunkQueue = [];
@@ -163,15 +265,13 @@ const GamePage = () => {
       if (!batch.length) return;
 
       chunkIpcInFlight += 1;
-      const payload = {
-        jobs: batch.map((it) => ({ cx: it.cx, cy: it.cy })),
-        chunkSize: CHUNK_SIZE,
-        options: DEFAULT_WORLD_OPTIONS,
-      };
+      const payload = createChunkRequestBuffer(batch, CHUNK_SIZE);
 
       ipc.invoke('world:generateChunks', payload)
         .then((results) => {
-          const list = Array.isArray(results) ? results : [];
+          const list = Array.isArray(results)
+            ? results
+            : parseChunkResponseBuffer(results);
           for (const item of list) {
             const key = chunkKey(item.cx, item.cy);
             pendingChunkKeys.delete(key);
@@ -182,7 +282,9 @@ const GamePage = () => {
               chunkSize: item.chunkSize || CHUNK_SIZE,
               chunkHeight: item.chunkHeight || CHUNK_HEIGHT,
               formatVersion: item.formatVersion || 1,
-              blocks: new Uint32Array(item.blocks),
+              blocks: item.blocks instanceof Uint32Array
+                ? item.blocks
+                : new Uint32Array(item.blocks),
             });
           }
         })
@@ -671,11 +773,10 @@ const GamePage = () => {
     let lastVelocitySendTime = 0;
 
     if (useIpcEcs) {
-      ipc.invoke('ecs:init', {
-        position: { x: playerWorld.x, y: 1, z: playerWorld.z },
-      }).then((result) => {
-        if (!result) return;
-        playerIndex = Number(result.index) || 0;
+      ipc.invoke('ecs:init', createEcsInitRequestBuffer({ x: playerWorld.x, y: 1, z: playerWorld.z })).then((result) => {
+        const parsedResult = parseEcsInitResponse(result);
+        if (!parsedResult) return;
+        playerIndex = Number(parsedResult.index) || 0;
       }).catch((error) => {
         console.warn('ecs:init failed, falling back to local integration:', error);
         useIpcEcs = false;
@@ -862,7 +963,7 @@ const GamePage = () => {
           Math.abs(resolvedVx - lastSentVelocity.x) > 0.0001 ||
           Math.abs(resolvedVz - lastSentVelocity.z) > 0.0001;
         if (changed || now - lastVelocitySendTime > 120) {
-          ipc.send('ecs:setVelocity', { index: playerIndex, vx: resolvedVx, vy: 0, vz: resolvedVz });
+          ipc.send('ecs:setVelocity', createEcsVelocityBuffer(resolvedVx, 0, resolvedVz));
           lastSentVelocity = { x: resolvedVx, y: 0, z: resolvedVz };
           lastVelocitySendTime = now;
         }

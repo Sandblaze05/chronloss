@@ -16,6 +16,142 @@ import { generateChunkData } from '../renderer/lib/engine/ChunkGeneration.js'
 const isProd = process.env.NODE_ENV === 'production'
 const ecsSessions = new Map()
 
+function toNodeBuffer(value) {
+  if (Buffer.isBuffer(value)) return value
+  if (value instanceof ArrayBuffer) return Buffer.from(value)
+  if (ArrayBuffer.isView(value)) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+  }
+  return null
+}
+
+function decodeChunkRequestPayload(payload) {
+  const bufferPayload = toNodeBuffer(payload)
+  if (!bufferPayload) {
+    return {
+      jobs: Array.isArray(payload?.jobs) ? payload.jobs : [],
+      chunkSize: Number(payload?.chunkSize) || CHUNK_SIZE,
+      options: payload?.options || DEFAULT_WORLD_OPTIONS,
+    }
+  }
+
+  if (bufferPayload.length < 8) {
+    return {
+      jobs: [],
+      chunkSize: CHUNK_SIZE,
+      options: DEFAULT_WORLD_OPTIONS,
+    }
+  }
+
+  const dv = new DataView(bufferPayload.buffer, bufferPayload.byteOffset, bufferPayload.byteLength)
+  const jobCount = dv.getUint32(0, true)
+  const chunkSize = dv.getUint32(4, true) || CHUNK_SIZE
+  const jobs = []
+  let offset = 8
+
+  for (let i = 0; i < jobCount; i += 1) {
+    if (offset + 8 > dv.byteLength) break
+    const cx = dv.getInt32(offset, true)
+    const cy = dv.getInt32(offset + 4, true)
+    jobs.push({ cx, cy })
+    offset += 8
+  }
+
+  return {
+    jobs,
+    chunkSize,
+    options: DEFAULT_WORLD_OPTIONS,
+  }
+}
+
+function encodeChunkResultsBuffer(chunks) {
+  const totalBytes = chunks.reduce((sum, chunk) => {
+    const blocks = chunk.blocks || new Uint32Array(0)
+    return sum + 20 + blocks.byteLength
+  }, 8)
+
+  const out = Buffer.allocUnsafe(totalBytes)
+  let offset = 0
+  out.writeUInt32LE(1, offset)
+  offset += 4
+  out.writeUInt32LE(chunks.length, offset)
+  offset += 4
+
+  for (const chunk of chunks) {
+    const blocks = chunk.blocks || new Uint32Array(0)
+    out.writeInt32LE(chunk.cx | 0, offset)
+    offset += 4
+    out.writeInt32LE(chunk.cy | 0, offset)
+    offset += 4
+    out.writeUInt32LE(chunk.chunkSize >>> 0, offset)
+    offset += 4
+    out.writeUInt32LE(chunk.chunkHeight >>> 0, offset)
+    offset += 4
+    out.writeUInt32LE(blocks.length >>> 0, offset)
+    offset += 4
+
+    const blocksBuffer = Buffer.from(blocks.buffer, blocks.byteOffset, blocks.byteLength)
+    blocksBuffer.copy(out, offset)
+    offset += blocksBuffer.length
+  }
+
+  return out
+}
+
+function decodeEcsInitPayload(payload) {
+  const bufferPayload = toNodeBuffer(payload)
+  if (!bufferPayload) {
+    const position = payload?.position || {}
+    return {
+      x: Number(position.x) || 0,
+      y: Number(position.y) || 1,
+      z: Number(position.z) || 0,
+    }
+  }
+
+  if (bufferPayload.length < 24) {
+    return { x: 0, y: 1, z: 0 }
+  }
+
+  const dv = new DataView(bufferPayload.buffer, bufferPayload.byteOffset, bufferPayload.byteLength)
+  return {
+    x: dv.getFloat64(0, true),
+    y: dv.getFloat64(8, true),
+    z: dv.getFloat64(16, true),
+  }
+}
+
+function encodeEcsInitResponse(session) {
+  const out = Buffer.allocUnsafe(28)
+  out.writeInt32LE(session.index | 0, 0)
+  out.writeDoubleLE(Number(session.position.x) || 0, 4)
+  out.writeDoubleLE(Number(session.position.y) || 1, 12)
+  out.writeDoubleLE(Number(session.position.z) || 0, 20)
+  return out
+}
+
+function decodeEcsVelocityPayload(payload) {
+  const bufferPayload = toNodeBuffer(payload)
+  if (!bufferPayload) {
+    return {
+      vx: Number(payload?.vx) || 0,
+      vy: Number(payload?.vy) || 0,
+      vz: Number(payload?.vz) || 0,
+    }
+  }
+
+  if (bufferPayload.length < 12) {
+    return { vx: 0, vy: 0, vz: 0 }
+  }
+
+  const dv = new DataView(bufferPayload.buffer, bufferPayload.byteOffset, bufferPayload.byteLength)
+  return {
+    vx: dv.getFloat32(0, true),
+    vy: dv.getFloat32(4, true),
+    vz: dv.getFloat32(8, true),
+  }
+}
+
 function stopEcsSession(webContentsId) {
   const existing = ecsSessions.get(webContentsId)
   if (!existing) return
@@ -117,13 +253,14 @@ app.on('window-all-closed', () => {
 })
 
 ipcMain.handle('world:generateChunks', async (_event, payload = {}) => {
-  const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
-  const chunkSize = Number(payload.chunkSize) || CHUNK_SIZE
-  const options = payload.options || DEFAULT_WORLD_OPTIONS
+  const decodedPayload = decodeChunkRequestPayload(payload)
+  const jobs = decodedPayload.jobs
+  const chunkSize = decodedPayload.chunkSize
+  const options = decodedPayload.options
   const MAX_JOBS_PER_CALL = 4
   const cappedJobs = jobs.slice(0, MAX_JOBS_PER_CALL)
 
-  return cappedJobs.map((job) => {
+  const chunks = cappedJobs.map((job) => {
     const cx = Number(job?.cx) || 0
     const cy = Number(job?.cy) || 0
     const data = generateChunkData(cx, cy, chunkSize, CHUNK_HEIGHT, options)
@@ -136,21 +273,22 @@ ipcMain.handle('world:generateChunks', async (_event, payload = {}) => {
       blocks: data.blocks,
     }
   })
+
+  return encodeChunkResultsBuffer(chunks)
 })
 
 ipcMain.handle('ecs:init', async (event, payload = {}) => {
-  const session = ensureEcsSession(event, payload.position || {})
-  return {
-    index: session.index,
-    position: session.position,
-  }
+  const initialPosition = decodeEcsInitPayload(payload)
+  const session = ensureEcsSession(event, initialPosition)
+  return encodeEcsInitResponse(session)
 })
 
 ipcMain.on('ecs:setVelocity', (event, payload = {}) => {
   const session = ensureEcsSession(event)
-  session.velocity.x = Number(payload.vx) || 0
-  session.velocity.y = Number(payload.vy) || 0
-  session.velocity.z = Number(payload.vz) || 0
+  const velocity = decodeEcsVelocityPayload(payload)
+  session.velocity.x = velocity.vx
+  session.velocity.y = velocity.vy
+  session.velocity.z = velocity.vz
 })
 
 ipcMain.on('ecs:stop', (event) => {
