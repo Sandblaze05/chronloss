@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import { BLOCK_IDS, CHUNK_HEIGHT, CHUNK_SIZE, chunkKey, DEFAULT_WORLD_OPTIONS, getVoxel, setVoxel } from '../lib/engine/World.js';
-import { buildChunkMeshes, disposeChunkMeshes } from '../lib/engine/Renderer.js';
+import { buildChunkMeshes, disposeChunkMeshes, recycleChunkMeshes } from '../lib/engine/Renderer.js';
 import { gridToWorld, worldToGrid as worldToGridLocal, tileSize } from '../lib/engine/GridMath.js';
 import { generateChunkData, sampleTerrainDebug } from '../lib/engine/ChunkGeneration.js';
 import { generateBiomeAt } from '../lib/engine/Noise.js';
@@ -80,7 +80,7 @@ function parseChunkResponseBuffer(payload) {
     if (offset + blockBytes > bytes.byteLength) break;
 
     const sourceBlocks = new Uint32Array(bytes.buffer, bytes.byteOffset + offset, blockCount);
-    const blocks = new Uint32Array(blockCount);
+    const blocks = new Uint32Array(bytes.buffer, bytes.byteOffset + offset, blockCount);
     blocks.set(sourceBlocks);
     offset += blockBytes;
 
@@ -397,10 +397,7 @@ const GamePage = () => {
 
         if (!chunks.has(key)) {
           if (result?.meshes) {
-            for (const m of result.meshes) {
-              if (!m) continue;
-              if (m.geometry) m.geometry.dispose();
-            }
+            recycleChunkMeshes(scene, result.meshes);
           }
           return;
         }
@@ -413,10 +410,7 @@ const GamePage = () => {
         await yieldToMain();
 
         if (!chunks.has(key)) {
-          for (const m of meshes) {
-            if (!m) continue;
-            if (m.geometry) m.geometry.dispose();
-          }
+          recycleChunkMeshes(scene, meshes);
           return;
         }
 
@@ -566,10 +560,7 @@ const GamePage = () => {
       // If a newer rebuild started, discard this stale result.
       if (!chunk || chunk.rebuildToken !== rebuildToken) {
         const staleMeshes = result?.meshes || [];
-        for (const m of staleMeshes) {
-          if (!m) continue;
-          if (m.geometry) m.geometry.dispose();
-        }
+        recycleChunkMeshes(scene, staleMeshes);
         return;
       }
 
@@ -587,9 +578,8 @@ const GamePage = () => {
       for (const m of oldMeshes) {
         const idx = chunkMeshes.indexOf(m);
         if (idx !== -1) chunkMeshes.splice(idx, 1);
-        scene.remove(m);
-        if (m.geometry) m.geometry.dispose();
       }
+      recycleChunkMeshes(scene, oldMeshes);
     }
 
     function getRaycastHit() {

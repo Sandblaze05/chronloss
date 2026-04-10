@@ -15,82 +15,42 @@ const voxelMat = new THREE.MeshStandardMaterial({
   flatShading: true,
   vertexColors: true,
 });
-const FACE_DEFS = [
-  {
-    normal: [1, 0, 0],
-    neighbor: [1, 0, 0],
-    corners: [
-      [1, 0, 0], [1, 1, 0], [1, 1, 1],
-      [1, 0, 0], [1, 1, 1], [1, 0, 1],
-    ],
-    uvs: [
-      [0, 0], [0, 1], [1, 1],
-      [0, 0], [1, 1], [1, 0],
-    ],
-  },
-  {
-    normal: [-1, 0, 0],
-    neighbor: [-1, 0, 0],
-    corners: [
-      [0, 0, 1], [0, 1, 1], [0, 1, 0],
-      [0, 0, 1], [0, 1, 0], [0, 0, 0],
-    ],
-    uvs: [
-      [0, 0], [0, 1], [1, 1],
-      [0, 0], [1, 1], [1, 0],
-    ],
-  },
-  {
-    normal: [0, 1, 0],
-    neighbor: [0, 1, 0],
-    corners: [
-      [0, 1, 1], [1, 1, 1], [1, 1, 0],
-      [0, 1, 1], [1, 1, 0], [0, 1, 0],
-    ],
-    uvs: [
-      [0, 0], [1, 0], [1, 1],
-      [0, 0], [1, 1], [0, 1],
-    ],
-  },
-  {
-    normal: [0, -1, 0],
-    neighbor: [0, -1, 0],
-    corners: [
-      [0, 0, 0], [1, 0, 0], [1, 0, 1],
-      [0, 0, 0], [1, 0, 1], [0, 0, 1],
-    ],
-    uvs: [
-      [0, 0], [1, 0], [1, 1],
-      [0, 0], [1, 1], [0, 1],
-    ],
-  },
-  {
-    normal: [0, 0, 1],
-    neighbor: [0, 0, 1],
-    corners: [
-      [1, 0, 1], [1, 1, 1], [0, 1, 1],
-      [1, 0, 1], [0, 1, 1], [0, 0, 1],
-    ],
-    uvs: [
-      [0, 0], [0, 1], [1, 1],
-      [0, 0], [1, 1], [1, 0],
-    ],
-  },
-  {
-    normal: [0, 0, -1],
-    neighbor: [0, 0, -1],
-    corners: [
-      [0, 0, 0], [0, 1, 0], [1, 1, 0],
-      [0, 0, 0], [1, 1, 0], [1, 0, 0],
-    ],
-    uvs: [
-      [0, 0], [0, 1], [1, 1],
-      [0, 0], [1, 1], [1, 0],
-    ],
-  },
-];
+const chunkMeshPool = [];
+
+function acquireChunkMesh() {
+  const mesh = chunkMeshPool.pop();
+  if (mesh) {
+    mesh.visible = true;
+    return mesh;
+  }
+
+  return new THREE.Mesh(new THREE.BufferGeometry(), voxelMat);
+}
+
+function recycleChunkMesh(scene, mesh) {
+  if (!mesh) return;
+  if (scene) scene.remove(mesh);
+  if (mesh.geometry) {
+    mesh.geometry.dispose();
+    mesh.geometry = new THREE.BufferGeometry();
+  }
+  mesh.userData.chunk = undefined;
+  mesh.visible = false;
+  chunkMeshPool.push(mesh);
+}
+
+export function recycleChunkMeshes(scene, meshes) {
+  if (!Array.isArray(meshes)) return;
+  for (const mesh of meshes) recycleChunkMesh(scene, mesh);
+}
 
 const yieldToMain = () => new Promise((resolve) => setTimeout(resolve, 0));
+const AXIS_UV = [
+  [1, 2],
+  [0, 2],
+  [0, 1],
+];
+const AXIS_PERMUTATION_SIGN = [1, -1, 1];
 
 function blockIdAt(chunk, x, y, z, chunkSize, chunkHeight) {
   if (!inChunkBounds(x, y, z, chunkSize, chunkHeight)) return BLOCK_IDS.AIR;
@@ -131,96 +91,185 @@ function colorForVoxel(blockId, voxelWord, aboveSolid) {
 export async function buildChunkMeshes(_scene, chunk, _tileGeom, _xOffset, _yOffset) {
   const chunkSize = chunk.chunkSize || CHUNK_SIZE;
   const chunkHeight = chunk.chunkHeight || CHUNK_HEIGHT;
+  const originX = chunk.cx * chunkSize;
+  const originZ = chunk.cy * chunkSize;
+  const dims = [chunkSize, chunkHeight, chunkSize];
 
-  let faceCount = 0;
-  for (let y = 0; y < chunkHeight; y++) {
-    for (let z = 0; z < chunkSize; z++) {
-      for (let x = 0; x < chunkSize; x++) {
-        const voxelWord = chunk.blocks[voxelIndex(x, y, z, chunkSize, chunkHeight)] >>> 0;
-        const blockId = getBlockIdFromVoxel(voxelWord);
-        if (blockId <= BLOCK_IDS.AIR) continue;
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const colors = [];
 
-        for (const faceDef of FACE_DEFS) {
-          const nx = x + faceDef.neighbor[0];
-          const ny = y + faceDef.neighbor[1];
-          const nz = z + faceDef.neighbor[2];
-          const neighborSolid = inChunkBounds(nx, ny, nz, chunkSize, chunkHeight)
-            ? blockIdAt(chunk, nx, ny, nz, chunkSize, chunkHeight) > BLOCK_IDS.AIR
-            : false;
-          if (!neighborSolid) faceCount += 1;
-        }
-      }
+  const emitVertex = (x, y, z, nx, ny, nz, uvx, uvy, cr, cg, cb) => {
+    positions.push(originX + x, y, originZ + z);
+    normals.push(nx, ny, nz);
+    uvs.push(uvx, uvy);
+    colors.push(cr, cg, cb);
+  };
+
+  const emitQuad = (axisD, axisU, axisV, sign, plane, uStart, vStart, width, height, cr, cg, cb) => {
+    const nx = axisD === 0 ? sign : 0;
+    const ny = axisD === 1 ? sign : 0;
+    const nz = axisD === 2 ? sign : 0;
+
+    const a = [0, 0, 0];
+    const b = [0, 0, 0];
+    const c = [0, 0, 0];
+    const d = [0, 0, 0];
+
+    a[axisD] = plane;
+    b[axisD] = plane;
+    c[axisD] = plane;
+    d[axisD] = plane;
+
+    a[axisU] = uStart;
+    a[axisV] = vStart;
+
+    b[axisU] = uStart + width;
+    b[axisV] = vStart;
+
+    c[axisU] = uStart + width;
+    c[axisV] = vStart + height;
+
+    d[axisU] = uStart;
+    d[axisV] = vStart + height;
+
+    const forwardWinding = (sign * AXIS_PERMUTATION_SIGN[axisD]) > 0;
+    if (forwardWinding) {
+      emitVertex(a[0], a[1], a[2], nx, ny, nz, 0, 0, cr, cg, cb);
+      emitVertex(b[0], b[1], b[2], nx, ny, nz, width, 0, cr, cg, cb);
+      emitVertex(c[0], c[1], c[2], nx, ny, nz, width, height, cr, cg, cb);
+
+      emitVertex(a[0], a[1], a[2], nx, ny, nz, 0, 0, cr, cg, cb);
+      emitVertex(c[0], c[1], c[2], nx, ny, nz, width, height, cr, cg, cb);
+      emitVertex(d[0], d[1], d[2], nx, ny, nz, 0, height, cr, cg, cb);
+      return;
     }
 
-    if ((y & 3) === 0) await yieldToMain();
+    emitVertex(a[0], a[1], a[2], nx, ny, nz, 0, 0, cr, cg, cb);
+    emitVertex(c[0], c[1], c[2], nx, ny, nz, width, height, cr, cg, cb);
+    emitVertex(b[0], b[1], b[2], nx, ny, nz, width, 0, cr, cg, cb);
+
+    emitVertex(a[0], a[1], a[2], nx, ny, nz, 0, 0, cr, cg, cb);
+    emitVertex(d[0], d[1], d[2], nx, ny, nz, 0, height, cr, cg, cb);
+    emitVertex(c[0], c[1], c[2], nx, ny, nz, width, height, cr, cg, cb);
+  };
+
+  const mask = [];
+
+  for (let axisD = 0; axisD < 3; axisD++) {
+    const axisU = AXIS_UV[axisD][0];
+    const axisV = AXIS_UV[axisD][1];
+    const maxD = dims[axisD];
+    const maxU = dims[axisU];
+    const maxV = dims[axisV];
+    const maskSize = maxU * maxV;
+
+    for (const sign of [-1, 1]) {
+      for (let plane = 0; plane <= maxD; plane++) {
+        mask.length = maskSize;
+
+        for (let v = 0; v < maxV; v++) {
+          for (let u = 0; u < maxU; u++) {
+            const xCell = axisD === 0 ? (sign > 0 ? plane - 1 : plane) : (axisU === 0 ? u : v);
+            const yCell = axisD === 1 ? (sign > 0 ? plane - 1 : plane) : (axisU === 1 ? u : v);
+            const zCell = axisD === 2 ? (sign > 0 ? plane - 1 : plane) : (axisU === 2 ? u : v);
+
+            if (!inChunkBounds(xCell, yCell, zCell, chunkSize, chunkHeight)) {
+              mask[(v * maxU) + u] = null;
+              continue;
+            }
+
+            const voxelWord = chunk.blocks[voxelIndex(xCell, yCell, zCell, chunkSize, chunkHeight)] >>> 0;
+            const blockId = getBlockIdFromVoxel(voxelWord);
+            if (blockId <= BLOCK_IDS.AIR) {
+              mask[(v * maxU) + u] = null;
+              continue;
+            }
+
+            const xNeighbor = xCell + (axisD === 0 ? sign : 0);
+            const yNeighbor = yCell + (axisD === 1 ? sign : 0);
+            const zNeighbor = zCell + (axisD === 2 ? sign : 0);
+            const neighborSolid = inChunkBounds(xNeighbor, yNeighbor, zNeighbor, chunkSize, chunkHeight)
+              ? (blockIdAt(chunk, xNeighbor, yNeighbor, zNeighbor, chunkSize, chunkHeight) > BLOCK_IDS.AIR)
+              : false;
+
+            if (neighborSolid) {
+              mask[(v * maxU) + u] = null;
+              continue;
+            }
+
+            const aboveSolid = blockIdAt(chunk, xCell, yCell + 1, zCell, chunkSize, chunkHeight) > BLOCK_IDS.AIR;
+            const [cr, cg, cb] = colorForVoxel(blockId, voxelWord, aboveSolid);
+            mask[(v * maxU) + u] = {
+              key: `${voxelWord}|${aboveSolid ? 1 : 0}`,
+              cr,
+              cg,
+              cb,
+            };
+          }
+        }
+
+        for (let v = 0; v < maxV; v++) {
+          for (let u = 0; u < maxU; ) {
+            const idx = (v * maxU) + u;
+            const cell = mask[idx];
+            if (!cell) {
+              u += 1;
+              continue;
+            }
+
+            let width = 1;
+            while (u + width < maxU) {
+              const next = mask[(v * maxU) + u + width];
+              if (!next || next.key !== cell.key) break;
+              width += 1;
+            }
+
+            let height = 1;
+            let canGrow = true;
+            while (v + height < maxV && canGrow) {
+              for (let k = 0; k < width; k++) {
+                const next = mask[((v + height) * maxU) + u + k];
+                if (!next || next.key !== cell.key) {
+                  canGrow = false;
+                  break;
+                }
+              }
+              if (canGrow) height += 1;
+            }
+
+            emitQuad(axisD, axisU, axisV, sign, plane, u, v, width, height, cell.cr, cell.cg, cell.cb);
+
+            for (let dv = 0; dv < height; dv++) {
+              for (let du = 0; du < width; du++) {
+                mask[((v + dv) * maxU) + u + du] = null;
+              }
+            }
+
+            u += width;
+          }
+        }
+
+        if ((plane & 3) === 0) await yieldToMain();
+      }
+    }
   }
 
-  if (faceCount === 0) {
+  if (positions.length === 0) {
     return { meshes: [], surfaceBlocks: [] };
   }
 
-  const positions = new Float32Array(faceCount * 6 * 3);
-  const normals = new Float32Array(faceCount * 6 * 3);
-  const uvs = new Float32Array(faceCount * 6 * 2);
-  const colors = new Float32Array(faceCount * 6 * 3);
-
-  let p = 0;
-  let n = 0;
-  let u = 0;
-  let c = 0;
-
-  for (let y = 0; y < chunkHeight; y++) {
-    for (let z = 0; z < chunkSize; z++) {
-      for (let x = 0; x < chunkSize; x++) {
-        const voxelWord = chunk.blocks[voxelIndex(x, y, z, chunkSize, chunkHeight)] >>> 0;
-        const blockId = getBlockIdFromVoxel(voxelWord);
-        if (blockId <= BLOCK_IDS.AIR) continue;
-
-        const aboveSolid = blockIdAt(chunk, x, y + 1, z, chunkSize, chunkHeight) > BLOCK_IDS.AIR;
-        const [cr, cg, cb] = colorForVoxel(blockId, voxelWord, aboveSolid);
-
-        const wx = chunk.cx * chunkSize + x;
-        const wz = chunk.cy * chunkSize + z;
-
-        for (const faceDef of FACE_DEFS) {
-          const nx = x + faceDef.neighbor[0];
-          const ny = y + faceDef.neighbor[1];
-          const nz = z + faceDef.neighbor[2];
-          const neighborSolid = inChunkBounds(nx, ny, nz, chunkSize, chunkHeight)
-            ? blockIdAt(chunk, nx, ny, nz, chunkSize, chunkHeight) > BLOCK_IDS.AIR
-            : false;
-          if (neighborSolid) continue;
-
-          for (let i = 0; i < 6; i++) {
-            const corner = faceDef.corners[i];
-            positions[p++] = wx + corner[0];
-            positions[p++] = y + corner[1];
-            positions[p++] = wz + corner[2];
-
-            normals[n++] = faceDef.normal[0];
-            normals[n++] = faceDef.normal[1];
-            normals[n++] = faceDef.normal[2];
-
-            const uv = faceDef.uvs[i];
-            uvs[u++] = uv[0];
-            uvs[u++] = uv[1];
-
-            colors[c++] = cr;
-            colors[c++] = cg;
-            colors[c++] = cb;
-          }
-        }
-      }
-    }
-
-    if ((y & 3) === 0) await yieldToMain();
-  }
+  const positionsArray = new Float32Array(positions);
+  const normalsArray = new Float32Array(normals);
+  const uvsArray = new Float32Array(uvs);
+  const colorsArray = new Float32Array(colors);
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('position', new THREE.BufferAttribute(positionsArray, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(normalsArray, 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvsArray, 2));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colorsArray, 3));
 
   const halfSize = chunkSize * 0.5;
   const halfHeight = chunkHeight * 0.5;
@@ -238,7 +287,10 @@ export async function buildChunkMeshes(_scene, chunk, _tileGeom, _xOffset, _yOff
     new THREE.Vector3((chunk.cx + 1) * chunkSize, chunkHeight, (chunk.cy + 1) * chunkSize)
   );
 
-  const mesh = new THREE.Mesh(geometry, voxelMat);
+  const mesh = acquireChunkMesh();
+  if (mesh.geometry) mesh.geometry.dispose();
+  mesh.geometry = geometry;
+  mesh.material = voxelMat;
   mesh.userData.chunk = chunk;
 
   return { meshes: [mesh], surfaceBlocks: [] };
@@ -246,11 +298,7 @@ export async function buildChunkMeshes(_scene, chunk, _tileGeom, _xOffset, _yOff
 
 export function disposeChunkMeshes(scene, chunk) {
   if (chunk.instancedMeshes) {
-    for (const m of chunk.instancedMeshes) {
-      if (!m) continue;
-      scene.remove(m);
-      if (m.geometry) m.geometry.dispose();
-    }
+    recycleChunkMeshes(scene, chunk.instancedMeshes);
     chunk.instancedMeshes = undefined;
   }
 }
