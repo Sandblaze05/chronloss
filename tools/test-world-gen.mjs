@@ -1,4 +1,12 @@
-import { BLOCK_IDS, CHUNK_SIZE, DEFAULT_WORLD_OPTIONS, voxelIndex } from '../renderer/lib/engine/World.js';
+import {
+  BLOCK_IDS,
+  CHUNK_SIZE,
+  DEFAULT_WORLD_OPTIONS,
+  getBlockIdFromVoxel,
+  getBlockLightFromVoxel,
+  getSkyLightFromVoxel,
+  voxelIndex,
+} from '../renderer/lib/engine/World.js';
 import { generateChunkData } from '../renderer/lib/engine/ChunkGeneration.js';
 
 function charForBlock(blockId) {
@@ -37,6 +45,7 @@ async function main() {
   const topHeights = new Array(chunkSize * chunkSize).fill(-1);
   const topBlocks = new Array(chunkSize * chunkSize).fill(BLOCK_IDS.AIR);
   let waterVoxels = 0;
+  let litVoxels = 0;
 
   for (let z = 0; z < chunkSize; z++) {
     for (let x = 0; x < chunkSize; x++) {
@@ -45,8 +54,12 @@ async function main() {
       let topBlock = BLOCK_IDS.AIR;
       for (let y = localChunkHeight - 1; y >= 0; y--) {
         const idx = voxelIndex(x, y, z, chunkSize, localChunkHeight);
-        const block = blocks[idx];
+        const voxelWord = blocks[idx] >>> 0;
+        const block = getBlockIdFromVoxel(voxelWord);
+        const skyLight = getSkyLightFromVoxel(voxelWord);
+        const blockLight = getBlockLightFromVoxel(voxelWord);
         if (block === BLOCK_IDS.WATER) waterVoxels++;
+        if (skyLight > 0 || blockLight > 0) litVoxels++;
         if (topY === -1 && block !== BLOCK_IDS.AIR) {
           topY = y;
           topBlock = block;
@@ -82,6 +95,7 @@ async function main() {
   console.log('\nMetrics:');
   console.log(`Sea level: ${opts.seaLevel ?? Math.floor(localChunkHeight * 0.28)}`);
   console.log(`Water voxels: ${waterVoxels} (${(waterRatio * 100).toFixed(2)}%)`);
+  console.log(`Lit voxels: ${litVoxels}`);
 
   console.log('\nDone.');
 }

@@ -1,4 +1,4 @@
-import { BLOCK_IDS, CHUNK_HEIGHT, chunkArrayLength, voxelIndex, DEFAULT_WORLD_OPTIONS } from './World.js';
+import { BLOCK_IDS, CHUNK_HEIGHT, chunkArrayLength, voxelIndex, DEFAULT_WORLD_OPTIONS, packVoxel } from './World.js';
 import { fbmPerlin2D, fbm2D, generateBiomeAt, perlin2D, perlin3D, ridgedPerlin2D, worley3D, hash2D_export } from './Noise.js';
 
 function clamp01(value) {
@@ -348,7 +348,7 @@ export function generateChunkData(cx, cy, chunkSize, chunkHeight, options = {}) 
     chunkHeight: localChunkHeight,
     terrainMaxHeight,
   };
-  const blocks = new Uint8Array(chunkArrayLength(chunkSize, localChunkHeight));
+  const blocks = new Uint32Array(chunkArrayLength(chunkSize, localChunkHeight));
   const startC = cx * chunkSize;
   const startR = cy * chunkSize;
 
@@ -374,18 +374,20 @@ export function generateChunkData(cx, cy, chunkSize, chunkHeight, options = {}) 
       for (let y = 0; y < localChunkHeight; y++) {
         const index = voxelIndex(x, y, z, chunkSize, localChunkHeight);
 
+        let blockId = BLOCK_IDS.AIR;
+
         if (y > surfaceY) {
           // Volumetric water fill up to sea level, otherwise open air.
-          blocks[index] = y <= seaLevel ? BLOCK_IDS.WATER : BLOCK_IDS.AIR;
+          blockId = y <= seaLevel ? BLOCK_IDS.WATER : BLOCK_IDS.AIR;
         } else if (y === surfaceY) {
           // Openings remove the cap block only when cave signals and lowland checks agree.
-          blocks[index] = hasSurfaceOpening ? BLOCK_IDS.AIR : palette.surface;
+          blockId = hasSurfaceOpening ? BLOCK_IDS.AIR : palette.surface;
         } else if (y >= surfaceY - topSoilDepth) {
           // Near-surface layer: allow connected opening shaft for selected columns.
           if (hasSurfaceOpening) {
-            blocks[index] = y <= seaLevel ? BLOCK_IDS.WATER : BLOCK_IDS.AIR;
+            blockId = y <= seaLevel ? BLOCK_IDS.WATER : BLOCK_IDS.AIR;
           } else {
-            blocks[index] = palette.sub;
+            blockId = palette.sub;
           }
         } else {
           // Deep layer: caves or stone
@@ -396,19 +398,23 @@ export function generateChunkData(cx, cy, chunkSize, chunkHeight, options = {}) 
 
             if (y <= lavaLevel && isFloor) {
               // Deep cave floors become lava
-              blocks[index] = BLOCK_IDS.LAVA;
+              blockId = BLOCK_IDS.LAVA;
             } else if (isStalactite(col, row, y, surfaceY, generationOpts)) {
               // Stalactites hang from ceiling
-              blocks[index] = palette.deep;
+              blockId = palette.deep;
             } else {
               // Regular cave air
-              blocks[index] = BLOCK_IDS.AIR;
+              blockId = BLOCK_IDS.AIR;
             }
           } else {
             // Solid rock
-            blocks[index] = palette.deep;
+            blockId = palette.deep;
           }
         }
+
+        const skyLight = y > surfaceY ? 15 : 0;
+        const blockLight = blockId === BLOCK_IDS.LAVA ? 12 : 0;
+        blocks[index] = packVoxel(blockId, skyLight, blockLight, 0);
       }
     }
   }

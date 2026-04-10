@@ -132,6 +132,7 @@ ipcMain.handle('world:generateChunks', async (_event, payload = {}) => {
       cy,
       chunkSize,
       chunkHeight: data.chunkHeight,
+      formatVersion: 2,
       blocks: data.blocks,
     }
   })

@@ -102,15 +102,15 @@ const GamePage = () => {
     floor.position.y = -0.01;
     scene.add(floor);
 
-    const highlightGeom = new THREE.PlaneGeometry(tileSize, tileSize);
+    const highlightGeom = new THREE.BoxGeometry(tileSize + 0.02, 1.02, tileSize + 0.02);
     const highlightMat = new THREE.MeshBasicMaterial({
       color: 0xddffff,
+      wireframe: true,
       transparent: true,
-      opacity: 0.4,
-      side: THREE.DoubleSide
+      opacity: 0.85,
+      depthTest: true,
     });
     const highlightMesh = new THREE.Mesh(highlightGeom, highlightMat);
-    highlightMesh.rotation.x = -Math.PI / 2;
     highlightMesh.visible = false;
     scene.add(highlightMesh);
 
@@ -124,13 +124,14 @@ const GamePage = () => {
     // chunk storage and active set
     const chunks = new Map(); // key -> chunk
     const activeChunks = new Set();
-    const chunkMeshes = []; // active chunk-level meshes (InstancedMesh) for raycasting
+    const chunkMeshes = []; // active chunk-level meshes for raycasting
     let hoveredInfo = null;
     let hoveredBiomeInfo = null;
-    const chunkRadius = 3; // load radius in chunks (increase for larger view)
+    const chunkRadius = 5; // load radius in chunks (increase for larger view)
     const loadQueue = [];
     const loadQueueSet = new Set();
     const generatedChunkQueue = [];
+    const unloadQueueSet = new Set();
     const pendingChunkKeys = new Set();
     const desiredChunkCenter = { cx: 0, cy: 0 };
     const ipc = typeof window !== 'undefined' ? window.ipc : null;
@@ -144,13 +145,16 @@ const GamePage = () => {
     let lastChunkApplyTimeMs = 0;
     let smoothedFps = 0;
     let lastDebugRefresh = 0;
+    let isMeshing = false;
+    const yieldToMain = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-    function buildChunkFromBlocks(cx, cy, chunkSize, chunkHeight, blocks) {
+    function buildChunkFromBlocks(cx, cy, chunkSize, chunkHeight, blocks, formatVersion = 1) {
       return {
         cx,
         cy,
         chunkSize,
         chunkHeight,
+        formatVersion,
         blocks,
       };
     }
@@ -177,7 +181,8 @@ const GamePage = () => {
               cy: item.cy,
               chunkSize: item.chunkSize || CHUNK_SIZE,
               chunkHeight: item.chunkHeight || CHUNK_HEIGHT,
-              blocks: new Uint8Array(item.blocks),
+              formatVersion: item.formatVersion || 1,
+              blocks: new Uint32Array(item.blocks),
             });
           }
         })
@@ -193,6 +198,7 @@ const GamePage = () => {
               cy: item.cy,
               chunkSize: CHUNK_SIZE,
               chunkHeight: data.chunkHeight,
+              formatVersion: 2,
               blocks: data.blocks,
             });
           }
@@ -244,6 +250,7 @@ const GamePage = () => {
             cy,
             chunkSize: CHUNK_SIZE,
             chunkHeight: data.chunkHeight,
+            formatVersion: 2,
             blocks: data.blocks,
           });
           generatedNow += 1;
@@ -268,27 +275,69 @@ const GamePage = () => {
       }
     }
 
-    function applyGeneratedChunk(generated) {
+    async function applyGeneratedChunk(generated) {
       const key = chunkKey(generated.cx, generated.cy);
       if (chunks.has(key)) return;
 
-      const chunk = buildChunkFromBlocks(generated.cx, generated.cy, generated.chunkSize, generated.chunkHeight, generated.blocks);
+      const chunk = buildChunkFromBlocks(
+        generated.cx,
+        generated.cy,
+        generated.chunkSize,
+        generated.chunkHeight,
+        generated.blocks,
+        generated.formatVersion || 1
+      );
       chunks.set(key, chunk);
-      buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
+      isMeshing = true;
 
-      if (chunk.instancedMeshes) {
-        for (const m of chunk.instancedMeshes) {
+      try {
+        const result = await buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
+
+        if (!chunks.has(key)) {
+          if (result?.meshes) {
+            for (const m of result.meshes) {
+              if (!m) continue;
+              if (m.geometry) m.geometry.dispose();
+            }
+          }
+          return;
+        }
+
+        const meshes = result?.meshes || [];
+        chunk.instancedMeshes = meshes;
+        chunk.surfaceBlocks = result?.surfaceBlocks || [];
+
+        // Give input/paint one tick before triggering GPU buffer uploads via scene.add.
+        await yieldToMain();
+
+        if (!chunks.has(key)) {
+          for (const m of meshes) {
+            if (!m) continue;
+            if (m.geometry) m.geometry.dispose();
+          }
+          return;
+        }
+
+        for (const m of meshes) {
           if (!m) continue;
+          scene.add(m);
           chunkMeshes.push(m);
         }
+
+        activeChunks.add(key);
+        loadQueueSet.delete(key);
+      } finally {
+        isMeshing = false;
       }
-      activeChunks.add(key);
-      loadQueueSet.delete(key);
     }
 
     function applyGeneratedChunksWithBudget() {
       const started = performance.now();
-      let applied = 0;
+      if (isMeshing || generatedChunkQueue.length === 0) {
+        lastChunkApplyCount = 0;
+        lastChunkApplyTimeMs = performance.now() - started;
+        return;
+      }
 
       if (generatedChunkQueue.length > 1) {
         generatedChunkQueue.sort((a, b) => {
@@ -298,19 +347,17 @@ const GamePage = () => {
         });
       }
 
-      while (generatedChunkQueue.length) {
-        const elapsed = performance.now() - started;
-        if (elapsed >= CHUNK_APPLY_BUDGET_MS) break;
-
-        const generated = generatedChunkQueue.shift();
-        const key = chunkKey(generated.cx, generated.cy);
-
-        if (!loadQueueSet.has(key) && !activeChunks.has(key)) continue;
-        applyGeneratedChunk(generated);
-        applied += 1;
+      const generated = generatedChunkQueue.shift();
+      const key = chunkKey(generated.cx, generated.cy);
+      if (!loadQueueSet.has(key) && !activeChunks.has(key)) {
+        lastChunkApplyCount = 0;
+        lastChunkApplyTimeMs = performance.now() - started;
+        return;
       }
 
-      lastChunkApplyCount = applied;
+      applyGeneratedChunk(generated);
+
+      lastChunkApplyCount = 1;
       lastChunkApplyTimeMs = performance.now() - started;
     }
 
@@ -329,6 +376,7 @@ const GamePage = () => {
       chunks.delete(key);
       activeChunks.delete(key);
       loadQueueSet.delete(key);
+      unloadQueueSet.delete(key);
     }
 
     function ensureChunksAround(cx, cy) {
@@ -371,9 +419,8 @@ const GamePage = () => {
       pumpChunkIpcJobs();
       // unload distant
       for (const k of Array.from(activeChunks)) {
-        if (!want.has(k)) {
-          const [ucx, ucy] = k.split(',').map(Number);
-          unloadChunk(ucx, ucy);
+        if (!want.has(k) && !unloadQueueSet.has(k)) {
+          unloadQueueSet.add(k);
         }
       }
     }
@@ -397,40 +444,127 @@ const GamePage = () => {
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2(-2, -2);
     let pointerMoved = false;
+    let lastHoverRaycastTime = 0;
+    const HOVER_RAYCAST_INTERVAL_MS = 45;
+    const HOVER_RAYCAST_MAX_DISTANCE = 96;
+    raycaster.far = HOVER_RAYCAST_MAX_DISTANCE;
+    const INF = Number.POSITIVE_INFINITY;
+    let lastHoverPickTimeMs = 0;
+    let avgHoverPickTimeMs = 0;
 
-    function rebuildChunkMesh(chunk) {
+    async function rebuildChunkMesh(chunk) {
       if (!chunk) return;
-      if (chunk.instancedMeshes) {
-        for (const m of chunk.instancedMeshes) {
-          const idx = chunkMeshes.indexOf(m);
-          if (idx !== -1) chunkMeshes.splice(idx, 1);
-        }
-      }
-      disposeChunkMeshes(scene, chunk);
-      buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
-      if (chunk.instancedMeshes) {
-        for (const m of chunk.instancedMeshes) {
+
+      const rebuildToken = (chunk.rebuildToken || 0) + 1;
+      chunk.rebuildToken = rebuildToken;
+      const oldMeshes = Array.isArray(chunk.instancedMeshes) ? chunk.instancedMeshes.filter(Boolean) : [];
+
+      const result = await buildChunkMeshes(scene, chunk, tileGeom, xOffset, yOffset);
+
+      // If a newer rebuild started, discard this stale result.
+      if (!chunk || chunk.rebuildToken !== rebuildToken) {
+        const staleMeshes = result?.meshes || [];
+        for (const m of staleMeshes) {
           if (!m) continue;
-          chunkMeshes.push(m);
+          if (m.geometry) m.geometry.dispose();
         }
+        return;
+      }
+
+      const nextMeshes = result?.meshes || [];
+      chunk.instancedMeshes = nextMeshes;
+      chunk.surfaceBlocks = result?.surfaceBlocks || [];
+
+      // Add new mesh first, then remove old mesh to avoid a visible hole.
+      for (const m of nextMeshes) {
+        if (!m) continue;
+        scene.add(m);
+        chunkMeshes.push(m);
+      }
+
+      for (const m of oldMeshes) {
+        const idx = chunkMeshes.indexOf(m);
+        if (idx !== -1) chunkMeshes.splice(idx, 1);
+        scene.remove(m);
+        if (m.geometry) m.geometry.dispose();
       }
     }
 
     function getRaycastHit() {
       raycaster.setFromCamera(pointer, camera);
-      const intersects = raycaster.intersectObjects(chunkMeshes);
-      if (!intersects.length) return null;
+      const origin = raycaster.ray.origin;
+      const dir = raycaster.ray.direction;
 
-      const hit = intersects[0];
-      const mesh = hit.object;
-      const instanceId = hit.instanceId;
-      const blockPositions = mesh?.userData?.blockPositions;
-      const chunk = mesh?.userData?.chunk;
-      if (!chunk || typeof instanceId !== 'number' || !blockPositions || !blockPositions[instanceId]) return null;
+      const originX = origin.x + (dir.x * 1e-4);
+      const originY = origin.y + (dir.y * 1e-4);
+      const originZ = origin.z + (dir.z * 1e-4);
 
-      const block = blockPositions[instanceId];
-      const normal = hit.face?.normal ? hit.face.normal.clone().round() : new THREE.Vector3(0, 1, 0);
-      return { chunk, block, normal };
+      let x = Math.floor(originX);
+      let y = Math.floor(originY);
+      let z = Math.floor(originZ);
+
+      const stepX = dir.x > 0 ? 1 : dir.x < 0 ? -1 : 0;
+      const stepY = dir.y > 0 ? 1 : dir.y < 0 ? -1 : 0;
+      const stepZ = dir.z > 0 ? 1 : dir.z < 0 ? -1 : 0;
+
+      const tDeltaX = stepX !== 0 ? Math.abs(1 / dir.x) : INF;
+      const tDeltaY = stepY !== 0 ? Math.abs(1 / dir.y) : INF;
+      const tDeltaZ = stepZ !== 0 ? Math.abs(1 / dir.z) : INF;
+
+      const nextBoundaryX = stepX > 0 ? x + 1 : x;
+      const nextBoundaryY = stepY > 0 ? y + 1 : y;
+      const nextBoundaryZ = stepZ > 0 ? z + 1 : z;
+
+      let tMaxX = stepX !== 0 ? (nextBoundaryX - originX) / dir.x : INF;
+      let tMaxY = stepY !== 0 ? (nextBoundaryY - originY) / dir.y : INF;
+      let tMaxZ = stepZ !== 0 ? (nextBoundaryZ - originZ) / dir.z : INF;
+
+      if (tMaxX < 0) tMaxX = 0;
+      if (tMaxY < 0) tMaxY = 0;
+      if (tMaxZ < 0) tMaxZ = 0;
+
+      let t = 0;
+      const hitNormal = new THREE.Vector3(0, 1, 0);
+      const maxSteps = 384;
+
+      for (let step = 0; step < maxSteps && t <= HOVER_RAYCAST_MAX_DISTANCE; step++) {
+        if (y < 0) break;
+
+        const blockId = getVoxelAtWorld(x, y, z);
+        if (blockId > BLOCK_IDS.AIR) {
+          const chunk = getChunkByWorldVoxel(x, z);
+          if (!chunk || y >= chunk.chunkHeight) return null;
+          const local = worldToLocalVoxel(x, z);
+          return {
+            chunk,
+            block: { x: local.lx, y, z: local.lz, wx: x, wz: z },
+            normal: hitNormal.clone(),
+          };
+        }
+
+        if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
+          x += stepX;
+          t = tMaxX;
+          tMaxX += tDeltaX;
+          hitNormal.set(-stepX, 0, 0);
+          continue;
+        }
+
+        if (tMaxY <= tMaxX && tMaxY <= tMaxZ) {
+          y += stepY;
+          t = tMaxY;
+          tMaxY += tDeltaY;
+          hitNormal.set(0, -stepY, 0);
+          continue;
+        }
+
+        z += stepZ;
+        t = tMaxZ;
+        tMaxZ += tDeltaZ;
+        hitNormal.set(0, 0, -stepZ);
+      }
+
+      return null;
     }
 
     function updatePointerFromEvent(event) {
@@ -450,7 +584,7 @@ const GamePage = () => {
       }
 
       updatePointerFromEvent(event);
-      pointerMoved = true;
+      pointerMoved = !orbitState.dragging;
     };
 
     const onPointerDown = (event) => {
@@ -792,6 +926,20 @@ const GamePage = () => {
       pumpChunkIpcJobs();
       applyGeneratedChunksWithBudget();
 
+      // Process one unload per frame to avoid disposal spikes.
+      if (unloadQueueSet.size > 0) {
+        const keyToUnload = unloadQueueSet.values().next().value;
+        unloadQueueSet.delete(keyToUnload);
+
+        if (activeChunks.has(keyToUnload)) {
+          const currentChunkForUnload = gridToChunk(playerGrid.c, playerGrid.r);
+          const [ucx, ucy] = keyToUnload.split(',').map(Number);
+          if (chunkDistanceSq(ucx, ucy, currentChunkForUnload.cx, currentChunkForUnload.cy) > chunkRadius * chunkRadius) {
+            unloadChunk(ucx, ucy);
+          }
+        }
+      }
+
       const alpha = accumulator / PHYSICS_DT;
       // Interpolate visual position between previous and current physics states
       const visX = THREE.MathUtils.lerp(playerPrevWorld.x, playerWorld.x, alpha);
@@ -812,37 +960,50 @@ const GamePage = () => {
       mouseAccumX = 0;
       mouseAccumY = 0;
 
-      const lookLerpSpeed = Math.min(1, 10 * frameTime);
-      currentLookAt.x = THREE.MathUtils.lerp(currentLookAt.x, visX, lookLerpSpeed);
-      currentLookAt.y = THREE.MathUtils.lerp(currentLookAt.y, visY + 0.75, lookLerpSpeed);
-      currentLookAt.z = THREE.MathUtils.lerp(currentLookAt.z, visZ, lookLerpSpeed);
+      const visualFrameTime = Math.min(frameTime, 0.033);
+      const lookLerpAlpha = 1 - Math.exp(-10 * visualFrameTime);
+      const camLerpAlpha = 1 - Math.exp(-8 * visualFrameTime);
+      const distanceLerpAlpha = 1 - Math.exp(-6 * visualFrameTime);
+      currentLookAt.x = THREE.MathUtils.lerp(currentLookAt.x, visX, lookLerpAlpha);
+      currentLookAt.y = THREE.MathUtils.lerp(currentLookAt.y, visY + 0.75, lookLerpAlpha);
+      currentLookAt.z = THREE.MathUtils.lerp(currentLookAt.z, visZ, lookLerpAlpha);
 
       orbitState.targetDistance = orbitState.targetDistance;
-      orbitState.distance = THREE.MathUtils.lerp(orbitState.distance, orbitState.targetDistance, Math.min(1, 6 * frameTime));
+      orbitState.distance = THREE.MathUtils.lerp(orbitState.distance, orbitState.targetDistance, distanceLerpAlpha);
       cameraOffsetDir.set(
         Math.cos(orbitState.yaw) * Math.cos(orbitState.pitch),
         Math.sin(orbitState.pitch),
         Math.sin(orbitState.yaw) * Math.cos(orbitState.pitch)
       );
       currentCameraPos.copy(currentLookAt).addScaledVector(cameraOffsetDir, orbitState.distance);
-      camera.position.x = THREE.MathUtils.lerp(camera.position.x, currentCameraPos.x, Math.min(1, 8 * frameTime));
-      camera.position.y = THREE.MathUtils.lerp(camera.position.y, currentCameraPos.y, Math.min(1, 8 * frameTime));
-      camera.position.z = THREE.MathUtils.lerp(camera.position.z, currentCameraPos.z, Math.min(1, 8 * frameTime));
+      camera.position.x = THREE.MathUtils.lerp(camera.position.x, currentCameraPos.x, camLerpAlpha);
+      camera.position.y = THREE.MathUtils.lerp(camera.position.y, currentCameraPos.y, camLerpAlpha);
+      camera.position.z = THREE.MathUtils.lerp(camera.position.z, currentCameraPos.z, camLerpAlpha);
       camera.lookAt(currentLookAt);
 
       if (pointerMoved) {
-        const hit = getRaycastHit();
-        if (hit) {
-          const wx = hit.block.wx;
-          const wz = hit.block.wz;
-          highlightMesh.position.x = wx;
-          highlightMesh.position.z = wz;
-          highlightMesh.position.y = hit.block.y + 1.02;
-          highlightMesh.visible = true;
-          hoveredInfo = { x: wx, y: hit.block.y, z: wz, id: getVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z) };
-        } else {
-          highlightMesh.visible = false;
-          hoveredInfo = null;
+        const nowMs = performance.now();
+        if (!orbitState.dragging && (nowMs - lastHoverRaycastTime) >= HOVER_RAYCAST_INTERVAL_MS) {
+          lastHoverRaycastTime = nowMs;
+          const pickStarted = performance.now();
+          const hit = getRaycastHit();
+          const pickElapsed = performance.now() - pickStarted;
+          lastHoverPickTimeMs = pickElapsed;
+          avgHoverPickTimeMs = avgHoverPickTimeMs === 0
+            ? pickElapsed
+            : THREE.MathUtils.lerp(avgHoverPickTimeMs, pickElapsed, 0.2);
+          if (hit) {
+            const wx = hit.block.wx;
+            const wz = hit.block.wz;
+            highlightMesh.position.x = wx + 0.5;
+            highlightMesh.position.z = wz + 0.5;
+            highlightMesh.position.y = hit.block.y + 0.5;
+            highlightMesh.visible = true;
+            hoveredInfo = { x: wx, y: hit.block.y, z: wz, id: getVoxel(hit.chunk, hit.block.x, hit.block.y, hit.block.z) };
+          } else {
+            highlightMesh.visible = false;
+            hoveredInfo = null;
+          }
         }
         pointerMoved = false;
       }
@@ -862,8 +1023,11 @@ const GamePage = () => {
           `chunks in range: ${activeChunks.size}/${expectedInRange}`,
           `chunk radius: ${chunkRadius}`,
           `queued: ${loadQueue.length}  pending: ${pendingChunkKeys.size}  generated: ${generatedChunkQueue.length}`,
+          `unload queued: ${unloadQueueSet.size}`,
           `chunk ipc in-flight: ${chunkIpcInFlight}/${CHUNK_IPC_MAX_IN_FLIGHT}`,
+          `meshing in flight: ${isMeshing ? 'yes' : 'no'}`,
           `chunk apply: ${lastChunkApplyCount} chunks, ${lastChunkApplyTimeMs.toFixed(2)}ms (budget ${CHUNK_APPLY_BUDGET_MS}ms)`,
+          `hover pick: last ${lastHoverPickTimeMs.toFixed(2)}ms  avg ${avgHoverPickTimeMs.toFixed(2)}ms`,
           `chunk source: ${chunkIpcEnabled ? 'electron-ipc' : 'local-sync'}`,
           `ecs source: ${useIpcEcs ? 'electron-ipc' : 'local'}`,
           `ecs player index: ${playerIndex}`,

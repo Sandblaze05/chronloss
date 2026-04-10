@@ -1,8 +1,8 @@
 import { createTile } from './Tile.js';
 import { generateHeightAt } from './Noise.js';
 
-export const CHUNK_SIZE = 16;
-export const CHUNK_HEIGHT = 64;
+export const CHUNK_SIZE = 32;
+export const CHUNK_HEIGHT = 128;
 
 export const BLOCK_IDS = {
   AIR: 0,
@@ -17,12 +17,62 @@ export const BLOCK_IDS = {
   LAVA: 9,
 };
 
+export const VOXEL_BLOCK_ID_BITS = 8;
+export const VOXEL_LIGHT_BITS = 4;
+export const VOXEL_FLAGS_BITS = 8;
+
+export const VOXEL_BLOCK_ID_SHIFT = 0;
+export const VOXEL_SKY_LIGHT_SHIFT = VOXEL_BLOCK_ID_SHIFT + VOXEL_BLOCK_ID_BITS;
+export const VOXEL_BLOCK_LIGHT_SHIFT = VOXEL_SKY_LIGHT_SHIFT + VOXEL_LIGHT_BITS;
+export const VOXEL_FLAGS_SHIFT = VOXEL_BLOCK_LIGHT_SHIFT + VOXEL_LIGHT_BITS;
+
+export const VOXEL_BLOCK_ID_MASK = (1 << VOXEL_BLOCK_ID_BITS) - 1;
+export const VOXEL_LIGHT_MASK = (1 << VOXEL_LIGHT_BITS) - 1;
+export const VOXEL_FLAGS_MASK = (1 << VOXEL_FLAGS_BITS) - 1;
+
+export function packVoxel(blockId, skyLight = 15, blockLight = 0, flags = 0) {
+  return (
+    ((blockId & VOXEL_BLOCK_ID_MASK) << VOXEL_BLOCK_ID_SHIFT)
+    | ((skyLight & VOXEL_LIGHT_MASK) << VOXEL_SKY_LIGHT_SHIFT)
+    | ((blockLight & VOXEL_LIGHT_MASK) << VOXEL_BLOCK_LIGHT_SHIFT)
+    | ((flags & VOXEL_FLAGS_MASK) << VOXEL_FLAGS_SHIFT)
+  ) >>> 0;
+}
+
+export function getBlockIdFromVoxel(voxelWord) {
+  return (voxelWord >>> VOXEL_BLOCK_ID_SHIFT) & VOXEL_BLOCK_ID_MASK;
+}
+
+export function getSkyLightFromVoxel(voxelWord) {
+  return (voxelWord >>> VOXEL_SKY_LIGHT_SHIFT) & VOXEL_LIGHT_MASK;
+}
+
+export function getBlockLightFromVoxel(voxelWord) {
+  return (voxelWord >>> VOXEL_BLOCK_LIGHT_SHIFT) & VOXEL_LIGHT_MASK;
+}
+
+export function getVoxelFlags(voxelWord) {
+  return (voxelWord >>> VOXEL_FLAGS_SHIFT) & VOXEL_FLAGS_MASK;
+}
+
+function hasPackedVoxelStorage(chunk) {
+  return !!(chunk?.blocks && chunk.blocks.BYTES_PER_ELEMENT >= 2);
+}
+
+function withClampedNibble(value) {
+  return Math.max(0, Math.min(VOXEL_LIGHT_MASK, Number(value) || 0));
+}
+
+function withClampedByte(value) {
+  return Math.max(0, Math.min(VOXEL_FLAGS_MASK, Number(value) || 0));
+}
+
 export const DEFAULT_WORLD_OPTIONS = {
   seed: 0,
   chunkHeight: CHUNK_HEIGHT,
   seaLevel: Math.floor(CHUNK_HEIGHT * 0.47),
-  scale: 150, // Larger scale works better with domain warping and multi-layer noise
-  continentScale: 1200,
+  scale: 500, // Larger scale works better with domain warping and multi-layer noise
+  continentScale: 2400,
   mountainMaskScale: 540,
   continentAmplitude: 0.62,
   hillAmplitude: 0.18,
@@ -67,6 +117,16 @@ export function chunkArrayLength(chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEI
   return chunkSize * chunkSize * chunkHeight;
 }
 
+export function createChunkVoxelArray(chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT, defaultBlockId = BLOCK_IDS.AIR) {
+  const count = chunkArrayLength(chunkSize, chunkHeight);
+  const blocks = new Uint32Array(count);
+  if (defaultBlockId === BLOCK_IDS.AIR) return blocks;
+
+  const packed = packVoxel(defaultBlockId, 0, 0, 0);
+  blocks.fill(packed);
+  return blocks;
+}
+
 export function voxelIndex(x, y, z, chunkSize = CHUNK_SIZE, chunkHeight = CHUNK_HEIGHT) {
   return x + (y * chunkSize) + (z * chunkSize * chunkHeight);
 }
@@ -77,13 +137,78 @@ export function inChunkBounds(x, y, z, chunkSize = CHUNK_SIZE, chunkHeight = CHU
 
 export function getVoxel(chunk, x, y, z) {
   if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return BLOCK_IDS.AIR;
-  return chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)];
+  const raw = chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)];
+  return hasPackedVoxelStorage(chunk) ? getBlockIdFromVoxel(raw) : raw;
 }
 
 export function setVoxel(chunk, x, y, z, blockId) {
   if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return false;
-  chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)] = blockId;
+  const index = voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight);
+  if (!hasPackedVoxelStorage(chunk)) {
+    chunk.blocks[index] = blockId;
+    return true;
+  }
+
+  const oldWord = chunk.blocks[index] >>> 0;
+  const sky = getSkyLightFromVoxel(oldWord);
+  const block = getBlockLightFromVoxel(oldWord);
+  const flags = getVoxelFlags(oldWord);
+  chunk.blocks[index] = packVoxel(blockId, sky, block, flags);
   return true;
+}
+
+export function getPackedVoxel(chunk, x, y, z) {
+  if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return 0;
+  const raw = chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)] >>> 0;
+  if (hasPackedVoxelStorage(chunk)) return raw;
+  return packVoxel(raw, 0, 0, 0);
+}
+
+export function setPackedVoxel(chunk, x, y, z, voxelWord) {
+  if (!inChunkBounds(x, y, z, chunk.chunkSize, chunk.chunkHeight)) return false;
+  chunk.blocks[voxelIndex(x, y, z, chunk.chunkSize, chunk.chunkHeight)] = voxelWord >>> 0;
+  return true;
+}
+
+export function getSkyLight(chunk, x, y, z) {
+  return getSkyLightFromVoxel(getPackedVoxel(chunk, x, y, z));
+}
+
+export function setSkyLight(chunk, x, y, z, value) {
+  const word = getPackedVoxel(chunk, x, y, z);
+  const next = packVoxel(
+    getBlockIdFromVoxel(word),
+    withClampedNibble(value),
+    getBlockLightFromVoxel(word),
+    getVoxelFlags(word)
+  );
+  return setPackedVoxel(chunk, x, y, z, next);
+}
+
+export function getBlockLight(chunk, x, y, z) {
+  return getBlockLightFromVoxel(getPackedVoxel(chunk, x, y, z));
+}
+
+export function setBlockLight(chunk, x, y, z, value) {
+  const word = getPackedVoxel(chunk, x, y, z);
+  const next = packVoxel(
+    getBlockIdFromVoxel(word),
+    getSkyLightFromVoxel(word),
+    withClampedNibble(value),
+    getVoxelFlags(word)
+  );
+  return setPackedVoxel(chunk, x, y, z, next);
+}
+
+export function setVoxelFlags(chunk, x, y, z, value) {
+  const word = getPackedVoxel(chunk, x, y, z);
+  const next = packVoxel(
+    getBlockIdFromVoxel(word),
+    getSkyLightFromVoxel(word),
+    getBlockLightFromVoxel(word),
+    withClampedByte(value)
+  );
+  return setPackedVoxel(chunk, x, y, z, next);
 }
 
 export function generateWorld(width, height, options = {}) {
